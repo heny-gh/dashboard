@@ -1,29 +1,4289 @@
+# ============================================================
+# MERGED STREAMLIT COMMUNITY CLOUD APP
+#
+# This single file contains:
+# 1) the forecasting pipeline formerly stored in forecasting.py; and
+# 2) the Streamlit decision dashboard formerly stored in new_streamlit_app.py.
+#
+# Deploy this file as app.py on Streamlit Community Cloud.
+# ============================================================
+
 from __future__ import annotations
 
-from io import BytesIO
-import base64
-import html
+from collections import Counter
+from dataclasses import dataclass, field
 import json
-from datetime import datetime, timezone, timedelta
+import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+import warnings
 
 import numpy as np
 import pandas as pd
+from sklearn.calibration import calibration_curve
+from sklearn.linear_model import Ridge
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    precision_score,
+    r2_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
+from xgboost import XGBClassifier, XGBRegressor
+
+try:
+    from scipy.stats import levene
+except Exception:
+    levene = None
+
+warnings.filterwarnings("ignore")
+
+RAW_FILE_PATH = Path(__file__).resolve().parent / "Final_data.xlsx"
+SHEET_NAME = "Sheet1"
+DATE_COL = "Date"
+TARGET_COL = "y_target"
+RET_COL = "r_usdtnd"
+EPS = 1e-8
+
+VOL_TARGET_WINDOW = 3
+LABEL_GAP = VOL_TARGET_WINDOW - 1
+HOLDOUT_YEARS = 1
+TRADING_DAYS_PER_YEAR = 252
+REGIME_BOOTSTRAP_ITERATIONS = 1000
+REGIME_BOOTSTRAP_BLOCK_SIZE = 5
+MIN_OBS_FOR_VARIANCE_TEST = 10
+LOW_SAMPLE_THRESHOLD = 50
+MODERATE_SAMPLE_THRESHOLD = 150
+
+ROLLING_WINDOW = 500
+STEP_SIZE = 21
+RANDOM_STATE = 42
+WINSOR_LOWER = 0.005
+WINSOR_UPPER = 0.995
+
+RIDGE_STABLE_FEATURE_COUNT = 30
+BROAD_FEATURE_COUNT = 50
+CLASSIFIER_TOP_PERCENTILE = 75
+REGIME_WEIGHT_BOOST = 0.20
+REGIME_WEIGHT_FLOOR = 0.05
+REGIME_WEIGHT_CAP = 0.95
+BLEND_WEIGHT_GRID = np.round(np.arange(0.0, 1.0001, 0.05), 2).tolist()
+RIDGE_ALPHA_GRID = [0.1, 1.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
+XGB_MAX_CONFIGS_PER_WINDOW = 12
+XGB_N_JOBS = 1
+
+BASELINE_GARCH_SPEC = {
+    "name": "GARCH-normal",
+    "mean": "Zero",
+    "vol": "GARCH",
+    "p": 1,
+    "o": 0,
+    "q": 1,
+    "dist": "normal",
+}
+PRIMARY_GARCH_SPEC = {
+    "name": "EGARCH-t",
+    "mean": "Zero",
+    "vol": "EGARCH",
+    "p": 1,
+    "o": 1,
+    "q": 1,
+    "dist": "t",
+}
+NO_WORSE_TOL = 1e-6
+
+EXPECTED_INPUT_COLUMNS = [
+    "Date",
+    "BRENT",
+    "DXY",
+    "VIX",
+    "GBP_USD",
+    "USD_JPY",
+    "EUR_USD",
+    "USDTND",
+    "sentiment_global",
+    "GOLD",
+    "MOVE",
+    "SP500",
+    "Tunindex",
+    "US_10Y",
+    "US_2Y_10_Spread",
+]
+
+OPTIONAL_INPUT_COLUMNS = [
+    "SOFR",
+    "tunibor_1m",
+    "tunibor_3m",
+    "tunibor_6m",
+    "tunibor_9m",
+    "tunibor_1y",
+    "USD_TND_3M_Forward_Premium",
+    "BID_ASK_SPREAD",
+]
+
+RAW_COLUMN_ALIASES = {
+    "EUR_USD": ["EUR/USD"],
+    "GBP_USD": ["GBP/USD"],
+    "USD_JPY": ["USD/JPY"],
+    "sentiment_global": ["Global sentiment", "Simple average sentiment"],
+    "SOFR": ["USDSOFR", "USD_SOFR", "sofr", "SOFR Overnight"],
+    "tunibor_1m": ["TUNIBOR_1M", "Tunibor 1M", "TUNIBOR 1M"],
+    "tunibor_3m": ["TUNIBOR_3M", "Tunibor 3M", "TUNIBOR 3M"],
+    "tunibor_6m": ["TUNIBOR_6M", "Tunibor 6M", "TUNIBOR 6M"],
+    "tunibor_9m": ["TUNIBOR_9M", "Tunibor 9M", "TUNIBOR 9M"],
+    "tunibor_1y": ["TUNIBOR_1Y", "Tunibor 1Y", "TUNIBOR 1Y", "tunibor_12m", "TUNIBOR_12M"],
+    "USD_TND_3M_Forward_Premium": [
+        "USDTND_3M_FORWARD_PREMIUM",
+        "USD_TND_3M_FORWARD_BID_PREMIUM",
+        "USD_TND_3M_Forward_Bid_Premium",
+        "USDTND 3M Forward Premium",
+        "USD/TND 3M Forward Premium",
+    ],
+    "BID_ASK_SPREAD": [
+        "USD_TND_BID_ASK_SPREAD",
+        "USDTND_BID_ASK_SPREAD",
+        "Bid Ask Spread",
+        "BID ASK SPREAD",
+        "bid_ask_spread",
+    ],
+}
+
+RAW_COLUMN_RENAMES = {
+    alias: canonical
+    for canonical, aliases in RAW_COLUMN_ALIASES.items()
+    for alias in aliases
+}
+
+FEATURE_NAME_MAP = {
+    "rv_usdtnd_1": "USD/TND 1-day realized volatility",
+    "rv_usdtnd_5": "USD/TND weekly realized volatility",
+    "rv_usdtnd_10": "USD/TND 10-day realized volatility",
+    "rv_eurusd_1": "EUR/USD volatility",
+    "rv_gbpusd_1": "GBP/USD volatility",
+    "rv_usdjpy_1": "USD/JPY volatility",
+    "rv_dxy_1": "Dollar Index volatility",
+    "VIX_lag1": "VIX global equity risk",
+    "MOVE_lag1": "MOVE US rates volatility",
+    "sentiment_global_lag1": "Global sentiment",
+    "rv_brent_1": "Brent oil volatility",
+    "rv_gold_1": "Gold volatility",
+    "rv_sp500_1": "S&P 500 volatility",
+    "rv_tunindex_1": "Tunindex volatility",
+    "global_fx_mean": "Average global FX volatility",
+    "global_local_ratio": "Global FX vs USD/TND volatility ratio",
+    "garch_cond_vol": "Selected GARCH benchmark volatility",
+    "event_regime_code": "Economic event regime code",
+    "covid_dummy": "COVID-19 event dummy",
+    "ukraine_war_dummy": "Russia-Ukraine war event dummy",
+    "us_tariff_dummy": "US tariff shock event dummy",
+    "iran_geopolitical_dummy": "Iran geopolitical escalation dummy",
+    "any_crisis_dummy": "Any major crisis event dummy",
+    "vix_x_covid": "VIX x COVID shock interaction",
+    "brent_x_ukraine": "Brent volatility x Ukraine war interaction",
+    "brent_x_iran": "Brent volatility x Iran geopolitical shock interaction",
+    "dxy_x_tariff": "DXY volatility x US tariff shock interaction",
+    "move_x_crisis": "MOVE x crisis interaction",
+    "sentiment_x_crisis": "Global sentiment x crisis interaction",
+    "tunibor_curve_level": "TUNIBOR curve level",
+    "tunibor_curve_slope_1y_minus_1m": "TUNIBOR 1Y minus 1M slope",
+    "tunibor_curve_curvature_6m_midpoint": "TUNIBOR curve curvature",
+    "tunibor_curve_level_change_5d": "Weekly change in TUNIBOR curve level",
+    "tunibor_curve_slope_1y_minus_1m_change_5d": "Weekly change in TUNIBOR curve slope",
+    "tunibor_curve_level_z20": "TUNIBOR curve level stress z-score",
+    "tunibor_curve_slope_1y_minus_1m_z20": "TUNIBOR curve slope stress z-score",
+    "tnd_usd_rate_spread_3m_proxy": "TND-USD short-rate spread proxy",
+    "tnd_usd_rate_spread_3m_proxy_change_5d": "Weekly change in TND-USD rate spread proxy",
+    "tnd_usd_rate_spread_3m_proxy_z20": "TND-USD rate spread stress z-score",
+    "usdtnd_3m_forward_bid_premium_points": "USD/TND 3M forward bid premium",
+    "usdtnd_3m_forward_premium_relative": "USD/TND 3M forward premium relative to spot",
+    "usdtnd_3m_forward_implied_rate_diff": "USD/TND 3M forward-implied rate differential",
+    "usdtnd_3m_forward_bid_premium_points_change_5d": "Weekly change in USD/TND 3M forward premium",
+    "usdtnd_3m_forward_premium_relative_change_5d": "Weekly change in USD/TND relative forward premium",
+    "usdtnd_3m_forward_implied_rate_diff_z20": "USD/TND forward-implied rate differential stress z-score",
+    "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy": "USD/TND forward basis versus TUNIBOR-SOFR proxy",
+    "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy_change_5d": "Weekly change in USD/TND forward basis",
+    "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy_z20": "USD/TND forward-basis stress z-score",
+    "usdtnd_bid_ask_spread": "USD/TND bid-ask spread",
+    "usdtnd_bid_ask_spread_change_5d": "Weekly change in USD/TND bid-ask spread",
+    "usdtnd_bid_ask_spread_z20": "USD/TND liquidity stress z-score",
+}
+
+BASE_FEATURES = [
+    "rv_usdtnd_1",
+    "rv_usdtnd_5",
+    "rv_usdtnd_10",
+    "rv_eurusd_1",
+    "rv_gbpusd_1",
+    "rv_usdjpy_1",
+    "rv_dxy_1",
+    "rv_brent_1",
+    "VIX_lag1",
+    "sentiment_global_lag1",
+    "rv_gold_1",
+    "rv_sp500_1",
+    "rv_tunindex_1",
+    "MOVE_lag1",
+    "US_10Y_lag1",
+    "US_2Y_10_Spread_lag1",
+    "tunibor_curve_level",
+    "tunibor_curve_slope_1y_minus_1m",
+    "tunibor_curve_curvature_6m_midpoint",
+    "tunibor_curve_level_change_5d",
+    "tunibor_curve_slope_1y_minus_1m_change_5d",
+    "tunibor_curve_level_z20",
+    "tunibor_curve_slope_1y_minus_1m_z20",
+    "tnd_usd_rate_spread_3m_proxy",
+    "tnd_usd_rate_spread_3m_proxy_change_5d",
+    "tnd_usd_rate_spread_3m_proxy_z20",
+    "usdtnd_3m_forward_bid_premium_points",
+    "usdtnd_3m_forward_premium_relative",
+    "usdtnd_3m_forward_implied_rate_diff",
+    "usdtnd_3m_forward_bid_premium_points_change_5d",
+    "usdtnd_3m_forward_premium_relative_change_5d",
+    "usdtnd_3m_forward_implied_rate_diff_z20",
+    "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy",
+    "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy_change_5d",
+    "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy_z20",
+    "usdtnd_bid_ask_spread",
+    "usdtnd_bid_ask_spread_change_5d",
+    "usdtnd_bid_ask_spread_z20",
+]
+
+NEW_PREPARED_FEATURES = [
+    "tunibor_curve_level",
+    "tunibor_curve_slope_1y_minus_1m",
+    "tunibor_curve_curvature_6m_midpoint",
+    "tunibor_curve_level_change_5d",
+    "tunibor_curve_slope_1y_minus_1m_change_5d",
+    "tunibor_curve_level_z20",
+    "tunibor_curve_slope_1y_minus_1m_z20",
+    "tnd_usd_rate_spread_3m_proxy",
+    "tnd_usd_rate_spread_3m_proxy_change_5d",
+    "tnd_usd_rate_spread_3m_proxy_z20",
+    "usdtnd_3m_forward_bid_premium_points",
+    "usdtnd_3m_forward_premium_relative",
+    "usdtnd_3m_forward_implied_rate_diff",
+    "usdtnd_3m_forward_bid_premium_points_change_5d",
+    "usdtnd_3m_forward_premium_relative_change_5d",
+    "usdtnd_3m_forward_implied_rate_diff_z20",
+    "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy",
+    "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy_change_5d",
+    "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy_z20",
+    "usdtnd_bid_ask_spread",
+    "usdtnd_bid_ask_spread_change_5d",
+    "usdtnd_bid_ask_spread_z20",
+]
+
+SIGNED_OR_CAN_BE_NEGATIVE_FEATURES = [
+    "sentiment_global_lag1",
+    "US_2Y_10_Spread_lag1",
+    "tunibor_curve_slope_1y_minus_1m",
+    "tunibor_curve_curvature_6m_midpoint",
+    "tunibor_curve_level_change_5d",
+    "tunibor_curve_slope_1y_minus_1m_change_5d",
+    "tunibor_curve_level_z20",
+    "tunibor_curve_slope_1y_minus_1m_z20",
+    "tnd_usd_rate_spread_3m_proxy",
+    "tnd_usd_rate_spread_3m_proxy_change_5d",
+    "tnd_usd_rate_spread_3m_proxy_z20",
+    "usdtnd_3m_forward_bid_premium_points_change_5d",
+    "usdtnd_3m_forward_premium_relative_change_5d",
+    "usdtnd_3m_forward_implied_rate_diff_z20",
+    "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy",
+    "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy_change_5d",
+    "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy_z20",
+    "usdtnd_bid_ask_spread_change_5d",
+    "usdtnd_bid_ask_spread_z20",
+]
+
+EXCLUDED_MODEL_COLUMNS = [
+    DATE_COL,
+    TARGET_COL,
+    "log_target",
+    RET_COL,
+    "event_regime_code",
+]
+
+SPLIT = ROLLING_WINDOW
+
+ARTIFACT_FILENAMES = {
+    "model_ready_dataset": "model_ready_dataset_3d.xlsx",
+    "development_results": "walkforward_results_dev_3d.xlsx",
+    "holdout_results": "walkforward_results_holdout_3d.xlsx",
+    "development_summary": "walkforward_summary_dev_3d.xlsx",
+    "holdout_summary": "walkforward_summary_holdout_3d.xlsx",
+    "final_forecast": "final_forecast_blend_3d.xlsx",
+    "high_vol_classifier_calibration_diagnostics": "high_vol_classifier_calibration_diagnostics_3d.xlsx",
+    "event_descriptive_stats": "event_regime_descriptive_stats_3d.xlsx",
+    "event_metrics_development": "event_regime_metrics_dev_3d.xlsx",
+    "event_metrics_holdout": "event_regime_metrics_holdout_3d.xlsx",
+    "run_metadata": "run_metadata.json",
+}
+DASHBOARD_PAYLOAD_FILENAME = "dashboard_payload.json"
+
+EVENT_TIMELINE_START = pd.Timestamp("2019-10-04")
+
+EVENT_REGIME_DEFINITIONS = {
+    "pre_covid_normal": {
+        "start": "2019-10-04",
+        "end": "2020-03-10",
+        "description": "Pre-COVID normal market regime"
+    },
+    "covid_shock": {
+        "start": "2020-03-11",
+        "end": "2020-12-31",
+        "description": "COVID-19 pandemic shock"
+    },
+    "post_covid_recovery": {
+        "start": "2021-01-01",
+        "end": "2022-02-23",
+        "description": "Post-COVID recovery and inflation build-up"
+    },
+    "ukraine_war_shock": {
+        "start": "2022-02-24",
+        "end": "2022-12-30",
+        "description": "Russia-Ukraine war initial shock"
+    },
+    "post_war_inflation_adjustment": {
+        "start": "2023-01-02",
+        "end": "2025-04-01",
+        "description": "Post-war inflation and monetary adjustment regime"
+    },
+    "us_tariff_shock": {
+        "start": "2025-04-02",
+        "end": "2025-06-12",
+        "description": "US tariff shock and trade-policy uncertainty"
+    },
+    "post_tariff_normalization": {
+        "start": "2025-06-13",
+        "end": "2026-02-27",
+        "description": "Post-tariff normalization regime"
+    },
+    "iran_geopolitical_shock": {
+        "start": "2026-02-28",
+        "end": None,
+        "description": "Iran / US-Israel geopolitical escalation"
+    },
+}
+
+EVENT_DUMMY_COLUMNS = [
+    "covid_dummy",
+    "ukraine_war_dummy",
+    "us_tariff_dummy",
+    "iran_geopolitical_dummy",
+    "any_crisis_dummy",
+]
+
+EVENT_INTERACTION_COLUMNS = [
+    "vix_x_covid",
+    "brent_x_ukraine",
+    "brent_x_iran",
+    "dxy_x_tariff",
+    "move_x_crisis",
+    "sentiment_x_crisis",
+]
+
+
+@dataclass
+class ForecastRunResult:
+    forecast: Dict[str, Any]
+    dashboard: Dict[str, Any]
+    development_summary: pd.DataFrame
+    holdout_summary: pd.DataFrame
+    development_results: pd.DataFrame
+    holdout_results: pd.DataFrame
+    artifacts: Dict[str, str] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+def first_existing_column(dataframe: pd.DataFrame, candidate_columns: list[str]) -> str:
+    for column_name in candidate_columns:
+        if column_name in dataframe.columns:
+            return column_name
+    raise KeyError(f"None of these columns were found: {candidate_columns}")
+
+
+def compute_file_sha256(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def get_package_versions() -> Dict[str, str]:
+    import platform
+
+    versions = {
+        "python": platform.python_version(),
+        "pandas": pd.__version__,
+        "numpy": np.__version__,
+    }
+    optional_packages = {
+        "sklearn": "sklearn",
+        "xgboost": "xgboost",
+        "statsmodels": "statsmodels",
+        "scipy": "scipy",
+        "arch": "arch",
+    }
+    for key, module_name in optional_packages.items():
+        try:
+            module = __import__(module_name)
+            versions[key] = str(getattr(module, "__version__", "unknown"))
+        except Exception:
+            versions[key] = "unavailable"
+    return versions
+
+
+def _write_high_vol_calibration_artifact(
+    output_path: Path,
+    diagnostics_summary: pd.DataFrame,
+    reliability_table: pd.DataFrame,
+    threshold_sensitivity: pd.DataFrame,
+) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(output_path) as writer:
+        diagnostics_summary.to_excel(writer, sheet_name="summary", index=False)
+        reliability_table.to_excel(writer, sheet_name="reliability_curve", index=False)
+        threshold_sensitivity.to_excel(writer, sheet_name="threshold_sensitivity", index=False)
+
+
+def build_high_volatility_calibration_diagnostics(
+    development_results: pd.DataFrame,
+    holdout_results: pd.DataFrame,
+    output_path: Path,
+    threshold_grid: Optional[list[float]] = None,
+    calibration_bins: int = 5,
+    high_volatility_cutoff: Optional[float] = None,
+) -> dict[str, pd.DataFrame]:
+    if threshold_grid is None:
+        threshold_grid = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
+
+    summary_columns = ["metric", "value", "interpretation"]
+    reliability_columns = [
+        "mean_predicted_probability",
+        "observed_high_volatility_frequency",
+        "calibration_gap",
+    ]
+    threshold_columns = [
+        "alert_threshold",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1_score",
+        "true_positives",
+        "false_positives",
+        "true_negatives",
+        "false_negatives",
+        "false_alert_rate",
+        "missed_high_vol_rate",
+    ]
+    reliability_table = pd.DataFrame(columns=reliability_columns)
+    threshold_sensitivity = pd.DataFrame(columns=threshold_columns)
+
+    actual_candidates = ["actual", "actual_volatility", "y_target", "target"]
+    probability_candidates = [
+        "regime_prob_high_vol",
+        "high_vol_probability",
+        "prob_high_vol",
+        "pred_high_vol_probability",
+    ]
+    cutoff_source = "fixed_event_threshold" if high_volatility_cutoff is not None else "development_results_q75"
+    cutoff_source_interpretation = (
+        "Fixed high-volatility threshold used consistently for classifier training, holdout evaluation, "
+        "calibration diagnostics, and live forecast interpretation."
+        if high_volatility_cutoff is not None
+        else "Identifies whether the calibration label used the same threshold as classifier training."
+    )
+
+    def unavailable_summary(reason: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "metric": "High-volatility cutoff",
+                    "value": np.nan,
+                    "interpretation": reason,
+                },
+                {
+                    "metric": "High-volatility cutoff source",
+                    "value": cutoff_source,
+                    "interpretation": "Identifies whether the calibration label used the same threshold as classifier training.",
+                },
+                {
+                    "metric": "Brier score",
+                    "value": np.nan,
+                    "interpretation": "Not computed because calibration inputs were unavailable.",
+                },
+                {
+                    "metric": "ROC-AUC",
+                    "value": np.nan,
+                    "interpretation": "Not computed because calibration inputs were unavailable.",
+                },
+                {
+                    "metric": "PR-AUC",
+                    "value": np.nan,
+                    "interpretation": "Not computed because calibration inputs were unavailable.",
+                },
+                {
+                    "metric": "Holdout observations",
+                    "value": 0,
+                    "interpretation": "No valid holdout observations were available for calibration diagnostics.",
+                },
+                {
+                    "metric": "Realized high-volatility frequency",
+                    "value": np.nan,
+                    "interpretation": "Not computed because calibration inputs were unavailable.",
+                },
+                {
+                    "metric": "Average predicted high-volatility probability",
+                    "value": np.nan,
+                    "interpretation": "Not computed because classifier probabilities were unavailable.",
+                },
+            ],
+            columns=summary_columns,
+        )
+
+    try:
+        development_actual_column = first_existing_column(development_results, actual_candidates)
+        holdout_actual_column = first_existing_column(holdout_results, actual_candidates)
+        holdout_probability_column = first_existing_column(holdout_results, probability_candidates)
+    except KeyError as exc:
+        diagnostics_summary = unavailable_summary(str(exc))
+        _write_high_vol_calibration_artifact(
+            output_path,
+            diagnostics_summary,
+            reliability_table,
+            threshold_sensitivity,
+        )
+        return {
+            "summary": diagnostics_summary,
+            "reliability_curve": reliability_table,
+            "threshold_sensitivity": threshold_sensitivity,
+        }
+
+    if high_volatility_cutoff is None:
+        development_actual = pd.to_numeric(development_results[development_actual_column], errors="coerce")
+        development_actual = development_actual.replace([np.inf, -np.inf], np.nan).dropna()
+        if development_actual.empty:
+            diagnostics_summary = unavailable_summary("Development-period actual volatility was empty or invalid, so the 75th percentile cutoff could not be computed.")
+            _write_high_vol_calibration_artifact(
+                output_path,
+                diagnostics_summary,
+                reliability_table,
+                threshold_sensitivity,
+            )
+            return {
+                "summary": diagnostics_summary,
+                "reliability_curve": reliability_table,
+                "threshold_sensitivity": threshold_sensitivity,
+            }
+        high_volatility_cutoff = float(development_actual.quantile(0.75))
+    else:
+        high_volatility_cutoff = float(high_volatility_cutoff)
+    holdout_actual = pd.to_numeric(holdout_results[holdout_actual_column], errors="coerce")
+    holdout_probability = pd.to_numeric(holdout_results[holdout_probability_column], errors="coerce")
+    valid = (
+        holdout_actual.replace([np.inf, -np.inf], np.nan).notna()
+        & holdout_probability.replace([np.inf, -np.inf], np.nan).notna()
+    )
+
+    actual_valid = holdout_actual.loc[valid].astype(float)
+    probability_valid = holdout_probability.loc[valid].clip(0.0, 1.0).astype(float)
+    realized_high_volatility = (actual_valid >= high_volatility_cutoff).astype(int)
+
+    n_obs = int(len(realized_high_volatility))
+    has_observations = n_obs > 0
+    has_two_classes = has_observations and len(np.unique(realized_high_volatility)) > 1
+
+    brier = (
+        float(brier_score_loss(realized_high_volatility, probability_valid))
+        if has_observations
+        else np.nan
+    )
+    roc_auc = (
+        float(roc_auc_score(realized_high_volatility, probability_valid))
+        if has_two_classes
+        else np.nan
+    )
+    pr_auc = (
+        float(average_precision_score(realized_high_volatility, probability_valid))
+        if has_two_classes
+        else np.nan
+    )
+    realized_frequency = float(realized_high_volatility.mean()) if has_observations else np.nan
+    average_probability = float(probability_valid.mean()) if has_observations else np.nan
+
+    diagnostics_summary = pd.DataFrame(
+        [
+            {
+                "metric": "High-volatility cutoff",
+                "value": high_volatility_cutoff,
+                "interpretation": cutoff_source_interpretation,
+            },
+            {
+                "metric": "High-volatility cutoff source",
+                "value": cutoff_source,
+                "interpretation": "Identifies whether the calibration label used the same threshold as classifier training.",
+            },
+            {
+                "metric": "Brier score",
+                "value": brier,
+                "interpretation": "Probability forecast error for the holdout high-volatility label; lower is better.",
+            },
+            {
+                "metric": "ROC-AUC",
+                "value": roc_auc,
+                "interpretation": "Holdout ranking quality across alert thresholds; unavailable when only one class appears.",
+            },
+            {
+                "metric": "PR-AUC",
+                "value": pr_auc,
+                "interpretation": "Average precision for the holdout high-volatility class; unavailable when only one class appears.",
+            },
+            {
+                "metric": "Holdout observations",
+                "value": n_obs,
+                "interpretation": "Valid holdout rows with actual realized volatility and classifier probability.",
+            },
+            {
+                "metric": "Realized high-volatility frequency",
+                "value": realized_frequency,
+                "interpretation": "Share of valid holdout observations at or above the development-period high-volatility cutoff.",
+            },
+            {
+                "metric": "Average predicted high-volatility probability",
+                "value": average_probability,
+                "interpretation": "Mean clipped high-volatility probability over valid holdout observations.",
+            },
+        ],
+        columns=summary_columns,
+    )
+
+    if has_observations:
+        try:
+            n_bins = max(1, min(int(calibration_bins), n_obs))
+            observed_frequency, mean_predicted_probability = calibration_curve(
+                realized_high_volatility,
+                probability_valid,
+                n_bins=n_bins,
+                strategy="quantile",
+            )
+            reliability_table = pd.DataFrame(
+                {
+                    "mean_predicted_probability": mean_predicted_probability,
+                    "observed_high_volatility_frequency": observed_frequency,
+                }
+            )
+            reliability_table["calibration_gap"] = (
+                reliability_table["observed_high_volatility_frequency"]
+                - reliability_table["mean_predicted_probability"]
+            )
+        except Exception:
+            reliability_table = pd.DataFrame(columns=reliability_columns)
+
+        threshold_rows = []
+        y_true = realized_high_volatility.to_numpy(dtype=int)
+        y_prob = probability_valid.to_numpy(dtype=float)
+        for threshold in threshold_grid:
+            y_pred = (y_prob >= float(threshold)).astype(int)
+            tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+            threshold_rows.append(
+                {
+                    "alert_threshold": float(threshold),
+                    "accuracy": float(accuracy_score(y_true, y_pred)),
+                    "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+                    "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+                    "f1_score": float(f1_score(y_true, y_pred, zero_division=0)),
+                    "true_positives": int(tp),
+                    "false_positives": int(fp),
+                    "true_negatives": int(tn),
+                    "false_negatives": int(fn),
+                    "false_alert_rate": float(fp / (fp + tn)) if (fp + tn) > 0 else np.nan,
+                    "missed_high_vol_rate": float(fn / (fn + tp)) if (fn + tp) > 0 else np.nan,
+                }
+            )
+        threshold_sensitivity = pd.DataFrame(threshold_rows, columns=threshold_columns)
+
+    _write_high_vol_calibration_artifact(
+        output_path,
+        diagnostics_summary,
+        reliability_table,
+        threshold_sensitivity,
+    )
+    return {
+        "summary": diagnostics_summary,
+        "reliability_curve": reliability_table,
+        "threshold_sensitivity": threshold_sensitivity,
+    }
+
+
+def assign_event_regimes(df: pd.DataFrame, date_col: str = DATE_COL) -> pd.DataFrame:
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+    df['event_regime'] = 'unclassified'
+    df['event_regime_description'] = ''
+    df['event_regime_code'] = -1
+
+    regime_codes = {
+        'pre_covid_normal': 0,
+        'covid_shock': 1,
+        'post_covid_recovery': 2,
+        'ukraine_war_shock': 3,
+        'post_war_inflation_adjustment': 4,
+        'us_tariff_shock': 5,
+        'post_tariff_normalization': 6,
+        'iran_geopolitical_shock': 7,
+        'unclassified': -1
+    }
+
+    for regime, details in EVENT_REGIME_DEFINITIONS.items():
+        start = pd.to_datetime(details['start']) if details['start'] else pd.Timestamp.min
+        end = pd.to_datetime(details['end']) if details['end'] else pd.Timestamp.max
+        mask = (df[date_col] >= start) & (df[date_col] <= end)
+        df.loc[mask, 'event_regime'] = regime
+        df.loc[mask, 'event_regime_description'] = details['description']
+        df.loc[mask, 'event_regime_code'] = regime_codes[regime]
+
+    df['covid_dummy'] = (df['event_regime'] == 'covid_shock').astype(int)
+    df['ukraine_war_dummy'] = (df['event_regime'] == 'ukraine_war_shock').astype(int)
+    df['us_tariff_dummy'] = (df['event_regime'] == 'us_tariff_shock').astype(int)
+    df['iran_geopolitical_dummy'] = (df['event_regime'] == 'iran_geopolitical_shock').astype(int)
+    df['any_crisis_dummy'] = ((df['covid_dummy'] == 1) | (df['ukraine_war_dummy'] == 1) | (df['us_tariff_dummy'] == 1) | (df['iran_geopolitical_dummy'] == 1)).astype(int)
+
+    return df
+
+
+ProgressCallback = Optional[Callable[[str], None]]
+
+
+def emit(progress_callback: ProgressCallback, message: str) -> None:
+    if progress_callback is not None:
+        progress_callback(message)
+
+
+def normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
+    return df.rename(columns=RAW_COLUMN_RENAMES)
+
+
+def get_expected_input_schema() -> Dict[str, Any]:
+    return {
+        "sheet_name": SHEET_NAME,
+        "required_columns": EXPECTED_INPUT_COLUMNS,
+        "optional_columns": OPTIONAL_INPUT_COLUMNS,
+        "accepted_aliases": {
+            canonical: [canonical] + aliases
+            for canonical, aliases in RAW_COLUMN_ALIASES.items()
+        },
+    }
+
+
+def _format_missing_columns(missing_cols: List[str]) -> str:
+    details = []
+    for col in missing_cols:
+        accepted = [col] + RAW_COLUMN_ALIASES.get(col, [])
+        details.append(f"{col} (accepted: {', '.join(accepted)})")
+    return "; ".join(details)
+
+
+def validate_input_file(raw_file_path: Path | str, sheet_name: str = SHEET_NAME) -> Dict[str, Any]:
+    raw_file_path = Path(raw_file_path)
+    if not raw_file_path.exists():
+        raise FileNotFoundError(f"{raw_file_path.resolve()} not found.")
+
+    try:
+        raw_df = pd.read_excel(raw_file_path, sheet_name=sheet_name)
+    except ValueError as exc:
+        raise ValueError(f"Could not read sheet '{sheet_name}' from uploaded Excel file.") from exc
+    except Exception as exc:
+        raise ValueError(f"Could not read uploaded Excel file: {exc}") from exc
+
+    normalized = normalize_input_columns(raw_df)
+    missing_cols = [col for col in EXPECTED_INPUT_COLUMNS if col not in normalized.columns]
+    optional_cols_available = [col for col in OPTIONAL_INPUT_COLUMNS if col in normalized.columns]
+    optional_cols_missing = [col for col in OPTIONAL_INPUT_COLUMNS if col not in normalized.columns]
+    if missing_cols:
+        raise ValueError(
+            "Uploaded file is missing required columns: "
+            f"{_format_missing_columns(missing_cols)}"
+        )
+
+    date_series = pd.to_datetime(normalized[DATE_COL], errors="coerce")
+    summary = {
+        "row_count": int(len(normalized)),
+        "column_count": int(len(normalized.columns)),
+        "date_min": date_series.min(),
+        "date_max": date_series.max(),
+        "missing_required_columns": [],
+        "optional_input_columns_available": optional_cols_available,
+        "optional_input_columns_missing": optional_cols_missing,
+        "missing_values": {
+            col: int(normalized[col].isna().sum())
+            for col in EXPECTED_INPUT_COLUMNS + optional_cols_available
+            if col in normalized.columns
+        },
+    }
+    return summary
+
+
+def clean_numeric_column(series: pd.Series) -> pd.Series:
+    cleaned = (
+        series.astype(str)
+        .str.strip()
+        .str.replace("%", "", regex=False)
+        .str.replace("\u00a0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+    cleaned = cleaned.replace({"": np.nan, "nan": np.nan, "None": np.nan, "NaT": np.nan})
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def ensure_decimal_rate(series: pd.Series) -> pd.Series:
+    numeric = clean_numeric_column(series)
+    median_abs = numeric.dropna().abs().median()
+    if pd.notna(median_abs) and median_abs > 1.0:
+        return numeric / 100.0
+    return numeric
+
+
+def realized_vol(series: pd.Series, window: int) -> pd.Series:
+    return np.sqrt(series.pow(2).rolling(window).sum())
+
+
+def add_rolling_zscore(df: pd.DataFrame, column: str, window: int = 20) -> pd.Series:
+    rolling_mean = df[column].rolling(window=window, min_periods=window).mean()
+    rolling_std = df[column].rolling(window=window, min_periods=window).std()
+    rolling_count = df[column].rolling(window=window, min_periods=window).count()
+    zscore = (df[column] - rolling_mean) / rolling_std.replace(0, np.nan)
+    return zscore.mask((rolling_std == 0) & (rolling_count >= window), 0.0)
+
+
+def add_tunibor_curve_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    required_tunibor = ["tunibor_1m", "tunibor_3m", "tunibor_6m", "tunibor_9m", "tunibor_1y"]
+    if not all(c in df.columns for c in required_tunibor):
+        return df
+
+    # TUNIBOR curve factors summarize local Tunisian money-market conditions
+    # through level, slope, and curvature.
+    df["tunibor_curve_level"] = df[required_tunibor].mean(axis=1)
+    df["tunibor_curve_slope_1y_minus_1m"] = df["tunibor_1y"] - df["tunibor_1m"]
+    df["tunibor_curve_curvature_6m_midpoint"] = (
+        df["tunibor_6m"] - (df["tunibor_1m"] + df["tunibor_1y"]) / 2.0
+    )
+
+    for feature in [
+        "tunibor_curve_level",
+        "tunibor_curve_slope_1y_minus_1m",
+        "tunibor_curve_curvature_6m_midpoint",
+    ]:
+        df[f"{feature}_change_1d"] = df[feature].diff(1)
+        df[f"{feature}_change_5d"] = df[feature].diff(5)
+        df[f"{feature}_z20"] = add_rolling_zscore(df, feature, window=20)
+
+    return df
+
+
+def add_sofr_tunibor_spread_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "SOFR" not in df.columns:
+        return df
+
+    # SOFR is used as the USD short-rate benchmark. Since the current file only
+    # contains overnight SOFR, the 3M TND-USD spread is labelled as a proxy.
+    usd_3m_proxy_col = "SOFR_90D" if "SOFR_90D" in df.columns else "SOFR"
+
+    if "tunibor_3m" in df.columns and usd_3m_proxy_col in df.columns:
+        df["tnd_usd_rate_spread_3m_proxy"] = df["tunibor_3m"] - df[usd_3m_proxy_col]
+        df["tnd_usd_rate_spread_3m_proxy_change_1d"] = (
+            df["tnd_usd_rate_spread_3m_proxy"].diff(1)
+        )
+        df["tnd_usd_rate_spread_3m_proxy_change_5d"] = (
+            df["tnd_usd_rate_spread_3m_proxy"].diff(5)
+        )
+        df["tnd_usd_rate_spread_3m_proxy_z20"] = add_rolling_zscore(
+            df,
+            "tnd_usd_rate_spread_3m_proxy",
+            window=20,
+        )
+
+    return df
+
+
+def add_usdtnd_forward_premium_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "USD_TND_3M_Forward_Premium" not in df.columns or "USDTND" not in df.columns:
+        return df
+
+    spot = pd.to_numeric(df["USDTND"], errors="coerce")
+    forward_premium_points = pd.to_numeric(
+        df["USD_TND_3M_Forward_Premium"],
+        errors="coerce",
+    )
+
+    valid = (spot > 0) & np.isfinite(spot) & np.isfinite(forward_premium_points)
+
+    # USD/TND 3M forward bid premium is treated as forward points, not as a
+    # percentage rate.
+    df["usdtnd_3m_forward_bid_premium_points"] = forward_premium_points.where(valid)
+
+    df["usdtnd_3m_forward_outright_proxy"] = (
+        spot + df["usdtnd_3m_forward_bid_premium_points"]
+    )
+
+    valid_forward = (
+        (spot > 0)
+        & (df["usdtnd_3m_forward_outright_proxy"] > 0)
+        & np.isfinite(df["usdtnd_3m_forward_outright_proxy"])
+    )
+
+    df["usdtnd_3m_forward_premium_relative"] = np.where(
+        valid_forward,
+        df["usdtnd_3m_forward_bid_premium_points"] / spot,
+        np.nan,
+    )
+
+    forward_t = 90.0 / 360.0
+
+    df["usdtnd_3m_forward_implied_rate_diff"] = np.where(
+        valid_forward,
+        np.log(df["usdtnd_3m_forward_outright_proxy"] / spot) / forward_t,
+        np.nan,
+    )
+
+    for feature in [
+        "usdtnd_3m_forward_bid_premium_points",
+        "usdtnd_3m_forward_premium_relative",
+        "usdtnd_3m_forward_implied_rate_diff",
+    ]:
+        df[f"{feature}_change_1d"] = df[feature].diff(1)
+        df[f"{feature}_change_5d"] = df[feature].diff(5)
+        df[f"{feature}_z20"] = add_rolling_zscore(df, feature, window=20)
+
+    if "tnd_usd_rate_spread_3m_proxy" in df.columns:
+        df["usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy"] = (
+            df["usdtnd_3m_forward_implied_rate_diff"]
+            - df["tnd_usd_rate_spread_3m_proxy"]
+        )
+        df["usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy_change_5d"] = (
+            df["usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy"].diff(5)
+        )
+        df["usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy_z20"] = add_rolling_zscore(
+            df,
+            "usdtnd_3m_forward_basis_vs_tunibor_sofr_proxy",
+            window=20,
+        )
+
+    return df
+
+
+def add_bid_ask_spread_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "BID_ASK_SPREAD" not in df.columns:
+        return df
+
+    # Bid-ask spread is used as a local FX liquidity-stress variable.
+    df["usdtnd_bid_ask_spread"] = pd.to_numeric(
+        df["BID_ASK_SPREAD"],
+        errors="coerce",
+    )
+
+    df["usdtnd_bid_ask_spread_change_1d"] = df["usdtnd_bid_ask_spread"].diff(1)
+    df["usdtnd_bid_ask_spread_change_5d"] = df["usdtnd_bid_ask_spread"].diff(5)
+    df["usdtnd_bid_ask_spread_z20"] = add_rolling_zscore(
+        df,
+        "usdtnd_bid_ask_spread",
+        window=20,
+    )
+
+    return df
+
+
+def add_new_market_features(df: pd.DataFrame) -> pd.DataFrame:
+    # All optional features are generated from raw data inside forecasting.py to
+    # preserve reproducibility and avoid manual Excel feature-engineering.
+    df = add_tunibor_curve_features(df)
+    df = add_sofr_tunibor_spread_features(df)
+    df = add_usdtnd_forward_premium_features(df)
+    df = add_bid_ask_spread_features(df)
+    return df
+
+
+def prepare_data(
+    raw_file_path: Path | str = RAW_FILE_PATH,
+    sheet_name: str = SHEET_NAME,
+    output_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    raw_file_path = Path(raw_file_path)
+    if not raw_file_path.exists():
+        raise FileNotFoundError(f"{raw_file_path.resolve()} not found.")
+
+    raw_df = normalize_input_columns(pd.read_excel(raw_file_path, sheet_name=sheet_name))
+    required_cols = EXPECTED_INPUT_COLUMNS
+    missing_cols = [col for col in required_cols if col not in raw_df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Missing columns in sheet '{sheet_name}': {_format_missing_columns(missing_cols)}"
+        )
+
+    available_optional_cols = [c for c in OPTIONAL_INPUT_COLUMNS if c in raw_df.columns]
+    raw_df = raw_df[required_cols + available_optional_cols].copy()
+    raw_df[DATE_COL] = pd.to_datetime(raw_df[DATE_COL], errors="coerce")
+    raw_df = raw_df.sort_values(DATE_COL).reset_index(drop=True)
+
+    numeric_cols = [
+        "BRENT",
+        "DXY",
+        "VIX",
+        "GBP_USD",
+        "USD_JPY",
+        "EUR_USD",
+        "USDTND",
+        "sentiment_global",
+        "GOLD",
+        "MOVE",
+        "SP500",
+        "Tunindex",
+        "US_10Y",
+        "US_2Y_10_Spread",
+    ]
+    for col in numeric_cols:
+        raw_df[col] = clean_numeric_column(raw_df[col])
+
+    rate_optional_cols = [
+        "SOFR",
+        "tunibor_1m",
+        "tunibor_3m",
+        "tunibor_6m",
+        "tunibor_9m",
+        "tunibor_1y",
+    ]
+    for col in rate_optional_cols:
+        if col in raw_df.columns:
+            raw_df[col] = ensure_decimal_rate(raw_df[col])
+
+    # Forward premium/points and bid-ask spread are raw FX price/liquidity
+    # variables; they are not divided by 100.
+    for col in ["USD_TND_3M_Forward_Premium", "BID_ASK_SPREAD"]:
+        if col in raw_df.columns:
+            raw_df[col] = clean_numeric_column(raw_df[col])
+
+    raw_df = add_new_market_features(raw_df)
+
+    global_raw_cols = [
+        "EUR_USD",
+        "GBP_USD",
+        "USD_JPY",
+        "BRENT",
+        "DXY",
+        "VIX",
+        "sentiment_global",
+        "GOLD",
+        "MOVE",
+        "SP500",
+        "Tunindex",
+        "US_10Y",
+        "US_2Y_10_Spread",
+    ]
+    for col in global_raw_cols:
+        raw_df[f"{col}_lag1"] = raw_df[col].shift(1)
+
+    raw_df[RET_COL] = np.log(raw_df["USDTND"] / raw_df["USDTND"].shift(1))
+    raw_df["r_eur_usd_lag1"] = np.log(raw_df["EUR_USD_lag1"] / raw_df["EUR_USD_lag1"].shift(1))
+    raw_df["r_gbp_usd_lag1"] = np.log(raw_df["GBP_USD_lag1"] / raw_df["GBP_USD_lag1"].shift(1))
+    raw_df["r_usd_jpy_lag1"] = np.log(raw_df["USD_JPY_lag1"] / raw_df["USD_JPY_lag1"].shift(1))
+    raw_df["r_brent_lag1"] = np.log(raw_df["BRENT_lag1"] / raw_df["BRENT_lag1"].shift(1))
+    raw_df["r_dxy_lag1"] = np.log(raw_df["DXY_lag1"] / raw_df["DXY_lag1"].shift(1))
+    raw_df["r_gold_lag1"] = np.log(raw_df["GOLD_lag1"] / raw_df["GOLD_lag1"].shift(1))
+    raw_df["r_sp500_lag1"] = np.log(raw_df["SP500_lag1"] / raw_df["SP500_lag1"].shift(1))
+    raw_df["r_tunindex_lag1"] = np.log(raw_df["Tunindex_lag1"] / raw_df["Tunindex_lag1"].shift(1))
+
+    raw_df["rv_usdtnd_1"] = realized_vol(raw_df[RET_COL], 1)
+    raw_df["rv_usdtnd_5"] = realized_vol(raw_df[RET_COL], 5)
+    raw_df["rv_usdtnd_10"] = realized_vol(raw_df[RET_COL], 10)
+    raw_df["rv_eurusd_1"] = realized_vol(raw_df["r_eur_usd_lag1"], 1)
+    raw_df["rv_gbpusd_1"] = realized_vol(raw_df["r_gbp_usd_lag1"], 1)
+    raw_df["rv_usdjpy_1"] = realized_vol(raw_df["r_usd_jpy_lag1"], 1)
+    raw_df["rv_brent_1"] = realized_vol(raw_df["r_brent_lag1"], 1)
+    raw_df["rv_dxy_1"] = realized_vol(raw_df["r_dxy_lag1"], 1)
+    raw_df["rv_gold_1"] = realized_vol(raw_df["r_gold_lag1"], 1)
+    raw_df["rv_sp500_1"] = realized_vol(raw_df["r_sp500_lag1"], 1)
+    raw_df["rv_tunindex_1"] = realized_vol(raw_df["r_tunindex_lag1"], 1)
+
+    future_sq = np.zeros(len(raw_df), dtype=float)
+    for k in range(1, VOL_TARGET_WINDOW + 1):
+        future_sq += raw_df[RET_COL].shift(-k).pow(2).fillna(np.nan).values
+    raw_df[TARGET_COL] = np.sqrt(future_sq)
+
+    base_prepared_cols = [
+        DATE_COL,
+        RET_COL,
+        "rv_usdtnd_1",
+        "rv_usdtnd_5",
+        "rv_usdtnd_10",
+        "rv_eurusd_1",
+        "rv_gbpusd_1",
+        "rv_usdjpy_1",
+        "rv_dxy_1",
+        "rv_brent_1",
+        "VIX_lag1",
+        "sentiment_global_lag1",
+        "rv_gold_1",
+        "rv_sp500_1",
+        "rv_tunindex_1",
+        "MOVE_lag1",
+        "US_10Y_lag1",
+        "US_2Y_10_Spread_lag1",
+        TARGET_COL,
+    ]
+    available_new_prepared_cols = [c for c in NEW_PREPARED_FEATURES if c in raw_df.columns]
+    df = raw_df[base_prepared_cols + available_new_prepared_cols].dropna().reset_index(drop=True)
+
+    # The final macro-event methodology starts at 2019-10-04.
+    # Earlier observations are outside the official event calendar and are
+    # excluded so downstream artifacts do not contain an "unclassified" regime.
+    df = df[df[DATE_COL] >= EVENT_TIMELINE_START].reset_index(drop=True)
+
+    df = assign_event_regimes(df)
+
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_excel(output_path, index=False)
+
+    return df
+
+
+def build_event_analysis_frame(
+    raw_file_path: Path | str = RAW_FILE_PATH,
+    sheet_name: str = SHEET_NAME,
+) -> pd.DataFrame:
+    """Build a stable event-volatility analysis frame independent of ML features.
+
+    Descriptive macro-event volatility statistics should not change when optional
+    model features such as TUNIBOR, SOFR, forward premium, or bid-ask spread
+    variables are added to the forecasting feature matrix.
+    """
+    raw_file_path = Path(raw_file_path)
+    if not raw_file_path.exists():
+        raise FileNotFoundError(f"{raw_file_path.resolve()} not found.")
+
+    raw_df = normalize_input_columns(pd.read_excel(raw_file_path, sheet_name=sheet_name))
+    required_cols = [DATE_COL, "USDTND"]
+    missing_cols = [col for col in required_cols if col not in raw_df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Missing columns in sheet '{sheet_name}': {_format_missing_columns(missing_cols)}"
+        )
+
+    optional_event_cols = [
+        "VIX",
+        "DXY",
+        "BRENT",
+        "MOVE",
+        "Tunindex",
+        "sentiment_global",
+    ]
+    available_event_cols = [c for c in optional_event_cols if c in raw_df.columns]
+    event_df = raw_df[required_cols + available_event_cols].copy()
+    event_df[DATE_COL] = pd.to_datetime(event_df[DATE_COL], errors="coerce")
+    event_df = event_df.sort_values(DATE_COL).reset_index(drop=True)
+
+    for col in ["USDTND"] + available_event_cols:
+        event_df[col] = clean_numeric_column(event_df[col])
+
+    event_df[RET_COL] = np.log(event_df["USDTND"] / event_df["USDTND"].shift(1))
+
+    future_sq = np.zeros(len(event_df), dtype=float)
+    for k in range(1, VOL_TARGET_WINDOW + 1):
+        future_sq += event_df[RET_COL].shift(-k).pow(2).fillna(np.nan).values
+    event_df[TARGET_COL] = np.sqrt(future_sq)
+
+    event_df["rv_usdtnd_1"] = realized_vol(event_df[RET_COL], 1)
+    event_df["rv_usdtnd_5"] = realized_vol(event_df[RET_COL], 5)
+    event_df["rv_usdtnd_10"] = realized_vol(event_df[RET_COL], 10)
+
+    for col in ["VIX", "MOVE", "DXY", "BRENT"]:
+        if col in event_df.columns:
+            event_df[f"{col}_lag1"] = event_df[col].shift(1)
+
+    if "DXY_lag1" in event_df.columns:
+        event_df["r_dxy_lag1"] = np.log(event_df["DXY_lag1"] / event_df["DXY_lag1"].shift(1))
+        event_df["rv_dxy_1"] = realized_vol(event_df["r_dxy_lag1"], 1)
+    if "BRENT_lag1" in event_df.columns:
+        event_df["r_brent_lag1"] = np.log(event_df["BRENT_lag1"] / event_df["BRENT_lag1"].shift(1))
+        event_df["rv_brent_1"] = realized_vol(event_df["r_brent_lag1"], 1)
+
+    event_df = event_df[event_df[DATE_COL] >= EVENT_TIMELINE_START].reset_index(drop=True)
+    event_df = assign_event_regimes(event_df)
+
+    minimal_required_cols = [
+        DATE_COL,
+        RET_COL,
+        TARGET_COL,
+        "rv_usdtnd_1",
+        "rv_usdtnd_5",
+        "rv_usdtnd_10",
+        "event_regime",
+        "event_regime_code",
+        "event_regime_description",
+    ]
+    return event_df.dropna(subset=minimal_required_cols).reset_index(drop=True)
+
+
+def build_features(data: pd.DataFrame) -> pd.DataFrame:
+    x = data.copy()
+    available_base_features = [c for c in BASE_FEATURES if c in x.columns]
+
+    for col in EVENT_DUMMY_COLUMNS:
+        if col not in x.columns:
+            x[col] = 0
+        x[col] = x[col].astype(int)
+
+    if 'event_regime_code' not in x.columns:
+        x['event_regime_code'] = 0
+
+    original_has_non_positive = {
+        c: bool(pd.to_numeric(x[c], errors="coerce").le(0).any())
+        for c in available_base_features
+    }
+
+    positive_base_features = [
+        c for c in available_base_features
+        if c not in SIGNED_OR_CAN_BE_NEGATIVE_FEATURES
+    ]
+
+    for c in positive_base_features:
+        x[c] = pd.to_numeric(x[c], errors="coerce").astype(float).clip(lower=EPS)
+
+    x[TARGET_COL] = pd.to_numeric(x[TARGET_COL], errors="coerce").astype(float).clip(lower=EPS)
+
+    for c in available_base_features:
+        if c in SIGNED_OR_CAN_BE_NEGATIVE_FEATURES:
+            x[c] = pd.to_numeric(x[c], errors="coerce").astype(float)
+
+    x["log_target"] = np.log(x[TARGET_COL])
+
+    for lag in [1, 2, 3, 4, 5, 10, 21]:
+        x[f"log_target_lag{lag}"] = x["log_target"].shift(lag)
+
+    x["har_d"] = x["log_target"].shift(1)
+    x["har_w"] = x["log_target"].shift(1).rolling(5, min_periods=5).mean()
+    x["har_m"] = x["log_target"].shift(1).rolling(22, min_periods=22).mean()
+
+    log_ret = x["log_target"].diff(1)
+    lam = 0.94
+    x["ewma_var"] = log_ret.ewm(alpha=1 - lam, adjust=False).var().shift(1)
+    x["ewma_std"] = np.sqrt(x["ewma_var"].clip(lower=0))
+    x["sq_innov_1d"] = log_ret.shift(1) ** 2
+    x["sq_innov_5d"] = (log_ret ** 2).rolling(5, min_periods=5).mean().shift(1)
+    x["abs_innov"] = log_ret.shift(1).abs()
+
+    for w in [5, 10, 22]:
+        x[f"roll_var_{w}"] = x["log_target"].shift(1).rolling(w, min_periods=w).var()
+        x[f"roll_std_{w}"] = np.sqrt(x[f"roll_var_{w}"].clip(lower=0))
+
+    for c in available_base_features:
+        if c in SIGNED_OR_CAN_BE_NEGATIVE_FEATURES or original_has_non_positive.get(c, True):
+            continue
+        x[f"log_{c}"] = np.log(x[c].clip(lower=EPS))
+
+    x["rv1_5d"] = x["rv_usdtnd_1"].rolling(5, min_periods=5).mean()
+    x["rv1_22d"] = x["rv_usdtnd_1"].rolling(22, min_periods=22).mean()
+
+    x["vix_x_rv1"] = x["VIX_lag1"] * x["rv_usdtnd_1"]
+    x["vix_x_rv5"] = x["VIX_lag1"] * x["rv_usdtnd_5"]
+    if "log_VIX_lag1" in x.columns and "log_rv_usdtnd_1" in x.columns:
+        x["log_vix_x_log_rv1"] = x["log_VIX_lag1"] * x["log_rv_usdtnd_1"]
+    x["dxy_x_vix"] = x["rv_dxy_1"] * x["VIX_lag1"]
+    x["brent_x_rv1"] = x["rv_brent_1"] * x["rv_usdtnd_1"]
+
+    x["vix_x_covid"] = x["VIX_lag1"] * x["covid_dummy"]
+    x["brent_x_ukraine"] = x["rv_brent_1"] * x["ukraine_war_dummy"]
+    x["brent_x_iran"] = x["rv_brent_1"] * x["iran_geopolitical_dummy"]
+    x["dxy_x_tariff"] = x["rv_dxy_1"] * x["us_tariff_dummy"]
+    x["move_x_crisis"] = x["MOVE_lag1"] * x["any_crisis_dummy"]
+    x["sentiment_x_crisis"] = x["sentiment_global_lag1"] * x["any_crisis_dummy"]
+
+    x["term_ratio_1_5"] = x["rv_usdtnd_1"] / (x["rv_usdtnd_5"] + EPS)
+    x["term_ratio_1_10"] = x["rv_usdtnd_1"] / (x["rv_usdtnd_10"] + EPS)
+    x["term_gap_1_5"] = x["rv_usdtnd_1"] - x["rv_usdtnd_5"]
+
+    gfx = ["rv_eurusd_1", "rv_gbpusd_1", "rv_usdjpy_1"]
+    x["global_fx_mean"] = x[gfx].mean(axis=1)
+    x["global_local_ratio"] = x["global_fx_mean"] / (x["rv_usdtnd_1"] + EPS)
+
+    for c, nm in [("VIX_lag1", "vix"), ("rv_usdtnd_1", "rv1")]:
+        for w in [20, 60]:
+            mu = x[c].rolling(w, min_periods=w).mean()
+            sg = x[c].rolling(w, min_periods=w).std() + EPS
+            x[f"{nm}_z{w}"] = (x[c] - mu) / sg
+
+    mu22 = x["rv_usdtnd_1"].rolling(22, min_periods=22).mean()
+    sg22 = x["rv_usdtnd_1"].rolling(22, min_periods=22).std() + EPS
+    x["rv1_jump"] = ((x["rv_usdtnd_1"] - mu22) / sg22).clip(-5, 5)
+
+    x["sent_5d"] = x["sentiment_global_lag1"].rolling(5, min_periods=5).mean()
+    x["sent_shock"] = x["sentiment_global_lag1"] - x["sent_5d"]
+
+    for c in available_base_features:
+        x[f"{c}_lag1"] = x[c].shift(1)
+
+    x["rv1_ma5"] = x["rv_usdtnd_1"].rolling(5, min_periods=5).mean()
+    x["rv1_ma10"] = x["rv_usdtnd_1"].rolling(10, min_periods=10).mean()
+
+    x["month"] = x[DATE_COL].dt.month
+    x["quarter"] = x[DATE_COL].dt.quarter
+
+    return x.dropna().reset_index(drop=True)
+
+
+def build_feature_frame(data: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    feat_df = build_features(data)
+    feature_cols = [
+        c
+        for c in feat_df.columns
+        if c not in EXCLUDED_MODEL_COLUMNS
+        and pd.api.types.is_numeric_dtype(feat_df[c])
+    ]
+    return feat_df, feature_cols
+
+
+def safe_exp(v: Any) -> np.ndarray:
+    return np.exp(np.asarray(v, dtype=float)) - EPS
+
+
+def ensure_event_features_in_selected_features(
+    selected_features: List[str],
+    all_feature_cols: List[str],
+    max_feature_count: Optional[int] = None,
+) -> List[str]:
+    """Ensure event dummies and interactions are preserved in selected feature subsets.
+    
+    Event dummies and event interaction terms are calendar-known context
+    variables. They are included as numerical model inputs to make the model
+    regime-aware, and the same event labels are also used as diagnostic overlays
+    to evaluate performance across event periods. String labels and ordinal event
+    codes are reporting fields and are not used as continuous numerical predictors.
+    """
+    result = list(selected_features)
+    event_features_to_force = EVENT_DUMMY_COLUMNS + EVENT_INTERACTION_COLUMNS
+    
+    for event_feat in event_features_to_force:
+        if event_feat in all_feature_cols and event_feat not in result:
+            result.append(event_feat)
+    
+    if max_feature_count is not None and len(result) > max_feature_count:
+        event_in_result = [f for f in result if f in event_features_to_force]
+        non_event_in_result = [f for f in result if f not in event_features_to_force]
+        max_non_event = max_feature_count - len(event_in_result)
+        result = non_event_in_result[:max_non_event] + event_in_result
+    
+    return result
+
+
+def dataframe_to_json_safe_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Convert dataframe to JSON-safe records with proper datetime and NaN handling."""
+    if df is None or df.empty:
+        return []
+    
+    safe_df = df.copy()
+    
+    for col in safe_df.columns:
+        if pd.api.types.is_datetime64_any_dtype(safe_df[col]):
+            safe_df[col] = safe_df[col].astype(str)
+    
+    safe_df = safe_df.replace([np.inf, -np.inf], np.nan)
+    safe_df = safe_df.where(pd.notnull(safe_df), None)
+    
+    return safe_df.to_dict(orient="records")
+
+
+def validate_event_methodology_integration(
+    feat_df: pd.DataFrame,
+    feature_cols: List[str],
+    stable_features_ridge: List[str],
+    stable_features_broad: List[str],
+) -> Dict[str, Any]:
+    """Validate that event-aware methodology is correctly integrated.
+    
+    Checks:
+    - All event dummies/interactions available in feat_df are in feature_cols.
+    - All event dummies/interactions in feature_cols are in stable_features_ridge.
+    - All event dummies/interactions in feature_cols are in stable_features_broad.
+    - Event strings (regime, description) are not in numerical feature_cols.
+    - event_regime_code is retained for reporting only and is not used as a predictor.
+    """
+    event_dummies = [c for c in EVENT_DUMMY_COLUMNS if c in feat_df.columns]
+    event_interactions = [c for c in EVENT_INTERACTION_COLUMNS if c in feat_df.columns]
+    all_event_numerical = event_dummies + event_interactions
+    
+    event_in_feature_cols = [f for f in all_event_numerical if f in feature_cols]
+    event_missing_from_feature_cols = [f for f in all_event_numerical if f not in feature_cols]
+    
+    event_in_ridge = [f for f in event_in_feature_cols if f in stable_features_ridge]
+    event_missing_from_ridge = [f for f in event_in_feature_cols if f not in stable_features_ridge]
+    
+    event_in_broad = [f for f in event_in_feature_cols if f in stable_features_broad]
+    event_missing_from_broad = [f for f in event_in_feature_cols if f not in stable_features_broad]
+    
+    event_string_cols = [c for c in ['event_regime', 'event_regime_description'] if c in feature_cols]
+    event_regime_code_used_as_predictor = (
+        "event_regime_code" in feature_cols
+        or "event_regime_code" in stable_features_ridge
+        or "event_regime_code" in stable_features_broad
+    )
+    
+    status = "PASS"
+    if event_missing_from_feature_cols:
+        status = "REVIEW"
+    if event_missing_from_ridge:
+        status = "REVIEW"
+    if event_missing_from_broad:
+        status = "REVIEW"
+    if event_string_cols:
+        status = "REVIEW"
+    if event_regime_code_used_as_predictor:
+        status = "REVIEW"
+    
+    return {
+        "event_features_available": all_event_numerical,
+        "event_features_in_feature_cols": event_in_feature_cols,
+        "event_features_missing_from_feature_cols": event_missing_from_feature_cols,
+        "event_features_in_ridge": event_in_ridge,
+        "event_features_missing_from_ridge": event_missing_from_ridge,
+        "event_features_in_broad": event_in_broad,
+        "event_features_missing_from_broad": event_missing_from_broad,
+        "event_string_columns_in_feature_cols": event_string_cols,
+        "event_regime_code_used_as_predictor": event_regime_code_used_as_predictor,
+        "status": status,
+    }
+
+
+def winsorise(X_fit: np.ndarray, X_other: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    ql = np.nanquantile(X_fit, WINSOR_LOWER, axis=0)
+    qh = np.nanquantile(X_fit, WINSOR_UPPER, axis=0)
+    return np.clip(X_fit, ql, qh), np.clip(X_other, ql, qh)
+
+
+def _safe_corr(a: Any, b: Any) -> float:
+    a_arr = np.asarray(a, dtype=float)
+    b_arr = np.asarray(b, dtype=float)
+    valid = ~(np.isnan(a_arr) | np.isnan(b_arr))
+    if valid.sum() < 2:
+        return np.nan
+    a_clean = a_arr[valid]
+    b_clean = b_arr[valid]
+    if np.std(a_clean) < 1e-8 or np.std(b_clean) < 1e-8:
+        return np.nan
+    return np.corrcoef(a_clean, b_clean)[0, 1]
+
+
+def annualize_target_vol_3d(vol_value):
+    # TARGET_COL is a 3-day realized-volatility proxy.
+    # Convert 3-day volatility to annualized volatility.
+    return vol_value * np.sqrt(TRADING_DAYS_PER_YEAR / VOL_TARGET_WINDOW)
+
+
+def annualize_daily_return_vol(return_series):
+    # Daily-return annualized volatility.
+    return np.nanstd(return_series, ddof=1) * np.sqrt(TRADING_DAYS_PER_YEAR)
+
+
+def robust_mad(values):
+    # Median absolute deviation scaled to be comparable to standard deviation.
+    clean = pd.Series(values).dropna().astype(float)
+    if clean.empty:
+        return np.nan
+    med = clean.median()
+    return 1.4826 * np.median(np.abs(clean - med))
+
+
+def reliability_label(observations):
+    if observations < LOW_SAMPLE_THRESHOLD:
+        return "Early / low sample"
+    if observations < MODERATE_SAMPLE_THRESHOLD:
+        return "Moderate sample"
+    return "Robust sample"
+
+
+def block_bootstrap_stat_ci(
+    values,
+    stat_func,
+    n_boot=REGIME_BOOTSTRAP_ITERATIONS,
+    block_size=REGIME_BOOTSTRAP_BLOCK_SIZE,
+    seed=RANDOM_STATE,
+):
+    # Use block bootstrap to preserve short-term serial dependence.
+    # Return 2.5% and 97.5% percentiles of the bootstrapped statistic.
+    clean = pd.Series(values).dropna().astype(float).values
+    n = len(clean)
+    if n < 2:
+        return np.nan, np.nan
+    rng = np.random.RandomState(seed)
+    block_size = int(max(1, min(block_size, n)))
+    stats = []
+    for _ in range(n_boot):
+        sampled = []
+        while len(sampled) < n:
+            start = rng.randint(0, n)
+            block = clean[start:min(start + block_size, n)]
+            if len(block) < block_size:
+                block = np.concatenate([block, clean[:block_size - len(block)]])
+            sampled.extend(block.tolist())
+        sampled = np.asarray(sampled[:n], dtype=float)
+        try:
+            val = stat_func(sampled)
+            if np.isfinite(val):
+                stats.append(val)
+        except Exception:
+            continue
+    if not stats:
+        return np.nan, np.nan
+    return float(np.percentile(stats, 2.5)), float(np.percentile(stats, 97.5))
+
+
+def brown_forsythe_vs_baseline(regime_returns, baseline_returns):
+    # Brown-Forsythe is Levene's test with center="median".
+    # It tests equality of variances and is more robust than classic Levene.
+    if levene is None:
+        return np.nan, np.nan, "Unavailable"
+    x = pd.Series(regime_returns).dropna().astype(float)
+    y = pd.Series(baseline_returns).dropna().astype(float)
+    if len(x) < MIN_OBS_FOR_VARIANCE_TEST or len(y) < MIN_OBS_FOR_VARIANCE_TEST:
+        return np.nan, np.nan, "Insufficient sample"
+    try:
+        stat, pvalue = levene(y.values, x.values, center="median")
+        if not np.isfinite(pvalue):
+            return np.nan, np.nan, "Unavailable"
+        label = "Significant variance difference" if pvalue < 0.05 else "Not statistically significant"
+        return float(stat), float(pvalue), label
+    except Exception:
+        return np.nan, np.nan, "Unavailable"
+
+
+def compute_event_regime_descriptive_stats(
+    feat_df: pd.DataFrame,
+    high_volatility_cutoff: Optional[float] = None,
+) -> pd.DataFrame:
+    if 'event_regime' not in feat_df.columns:
+        return pd.DataFrame()
+    
+    df = feat_df.copy()
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors='coerce')
+    
+    grouped = df.groupby(['event_regime', 'event_regime_code', 'event_regime_description'])
+
+    agg_spec = {
+        "start_date": (DATE_COL, "min"),
+        "end_date": (DATE_COL, "max"),
+        "observations": (DATE_COL, "count"),
+        "mean_target_vol": (TARGET_COL, "mean"),
+        "median_target_vol": (TARGET_COL, "median"),
+        "q75_target_vol": (TARGET_COL, lambda x: x.quantile(0.75)),
+        "q90_target_vol": (TARGET_COL, lambda x: x.quantile(0.90)),
+        "max_target_vol": (TARGET_COL, "max"),
+        "target_vol_iqr": (TARGET_COL, lambda x: x.quantile(0.75) - x.quantile(0.25)),
+        "target_vol_mad": (TARGET_COL, robust_mad),
+        "annualized_return_vol": (RET_COL, annualize_daily_return_vol),
+        "crisis_flag": ("any_crisis_dummy", "max") if "any_crisis_dummy" in df.columns else ("event_regime", lambda x: 0),
+    }
+    optional_agg_spec = {
+        "mean_rv_usdtnd_1": ("rv_usdtnd_1", "mean"),
+        "mean_rv_usdtnd_5": ("rv_usdtnd_5", "mean"),
+        "mean_vix": ("VIX_lag1", "mean"),
+        "mean_dxy_vol": ("rv_dxy_1", "mean"),
+        "mean_brent_vol": ("rv_brent_1", "mean"),
+    }
+    for output_col, (source_col, func) in optional_agg_spec.items():
+        if source_col in df.columns:
+            agg_spec[output_col] = (source_col, func)
+
+    stats = grouped.agg(**agg_spec).reset_index()
+
+    stats['mean_target_vol_annualized'] = stats['mean_target_vol'].apply(annualize_target_vol_3d)
+    stats['median_target_vol_annualized'] = stats['median_target_vol'].apply(annualize_target_vol_3d)
+    stats['q75_target_vol_annualized'] = stats['q75_target_vol'].apply(annualize_target_vol_3d)
+    stats['q90_target_vol_annualized'] = stats['q90_target_vol'].apply(annualize_target_vol_3d)
+    stats['max_target_vol_annualized'] = stats['max_target_vol'].apply(annualize_target_vol_3d)
+    stats['target_vol_mad_annualized'] = stats['target_vol_mad'].apply(annualize_target_vol_3d)
+
+    if high_volatility_cutoff is not None:
+        high_vol_cutoff = float(high_volatility_cutoff)
+        share_high = df.groupby('event_regime')[TARGET_COL].apply(
+            lambda x: float((pd.to_numeric(x, errors="coerce") >= high_vol_cutoff).mean())
+        )
+        stats['share_high_vol_days'] = stats['event_regime'].map(share_high)
+    else:
+        stats['share_high_vol_days'] = np.nan
+
+    ci_records = []
+    for _, row in stats.iterrows():
+        regime_values = df.loc[df['event_regime'] == row['event_regime'], TARGET_COL]
+        ci_low, ci_high = block_bootstrap_stat_ci(
+            regime_values,
+            lambda sample: annualize_target_vol_3d(np.nanmean(sample)),
+        )
+        ci_records.append((ci_low, ci_high))
+    stats['annualized_target_vol_ci_low'] = [ci[0] for ci in ci_records]
+    stats['annualized_target_vol_ci_high'] = [ci[1] for ci in ci_records]
+    
+    # Compute percentages
+    pre_covid_mean = stats.loc[stats['event_regime'] == 'pre_covid_normal', 'mean_target_vol']
+    if not pre_covid_mean.empty:
+        pre_covid_mean = pre_covid_mean.iloc[0]
+        stats['mean_target_vol_vs_pre_covid_pct'] = 100 * (stats['mean_target_vol'] / pre_covid_mean - 1)
+    else:
+        stats['mean_target_vol_vs_pre_covid_pct'] = np.nan
+    
+    full_sample_mean = df[TARGET_COL].mean()
+    stats['mean_target_vol_vs_full_sample_pct'] = 100 * (stats['mean_target_vol'] / full_sample_mean - 1)
+
+    pre_ann = stats.loc[stats['event_regime'] == 'pre_covid_normal', 'mean_target_vol_annualized']
+    if not pre_ann.empty and np.isfinite(pre_ann.iloc[0]) and pre_ann.iloc[0] != 0:
+        pre_ann = pre_ann.iloc[0]
+        stats['annualized_target_vol_vs_pre_covid_pct'] = 100 * (stats['mean_target_vol_annualized'] / pre_ann - 1)
+        stats['annualized_target_vol_ci_low_vs_pre_covid_pct'] = 100 * (stats['annualized_target_vol_ci_low'] / pre_ann - 1)
+        stats['annualized_target_vol_ci_high_vs_pre_covid_pct'] = 100 * (stats['annualized_target_vol_ci_high'] / pre_ann - 1)
+    else:
+        stats['annualized_target_vol_vs_pre_covid_pct'] = np.nan
+        stats['annualized_target_vol_ci_low_vs_pre_covid_pct'] = np.nan
+        stats['annualized_target_vol_ci_high_vs_pre_covid_pct'] = np.nan
+
+    broad_normal = df.loc[df.get('any_crisis_dummy', pd.Series(0, index=df.index)).eq(0)]
+    if not broad_normal.empty:
+        broad_mean = pd.to_numeric(broad_normal[TARGET_COL], errors="coerce").mean()
+        broad_mean_ann = annualize_target_vol_3d(broad_mean)
+        broad_q90_ann = annualize_target_vol_3d(pd.to_numeric(broad_normal[TARGET_COL], errors="coerce").quantile(0.90))
+        if np.isfinite(broad_mean) and broad_mean != 0:
+            stats['mean_target_vol_vs_broad_normal_pct'] = 100 * (stats['mean_target_vol'] / broad_mean - 1)
+        else:
+            stats['mean_target_vol_vs_broad_normal_pct'] = np.nan
+        if np.isfinite(broad_mean_ann) and broad_mean_ann != 0:
+            stats['mean_target_vol_annualized_vs_broad_normal_pct'] = 100 * (
+                stats['mean_target_vol_annualized'] / broad_mean_ann - 1
+            )
+        else:
+            stats['mean_target_vol_annualized_vs_broad_normal_pct'] = np.nan
+        if np.isfinite(broad_q90_ann) and broad_q90_ann != 0:
+            stats['q90_target_vol_annualized_vs_broad_normal_pct'] = 100 * (
+                stats['q90_target_vol_annualized'] / broad_q90_ann - 1
+            )
+        else:
+            stats['q90_target_vol_annualized_vs_broad_normal_pct'] = np.nan
+    else:
+        stats['mean_target_vol_vs_broad_normal_pct'] = np.nan
+        stats['mean_target_vol_annualized_vs_broad_normal_pct'] = np.nan
+        stats['q90_target_vol_annualized_vs_broad_normal_pct'] = np.nan
+
+    baseline_returns = df.loc[df['event_regime'] == 'pre_covid_normal', RET_COL]
+    bf_records = []
+    for _, row in stats.iterrows():
+        if row['event_regime'] == 'pre_covid_normal':
+            bf_records.append((np.nan, np.nan, "Baseline"))
+            continue
+        regime_returns = df.loc[df['event_regime'] == row['event_regime'], RET_COL]
+        bf_records.append(brown_forsythe_vs_baseline(regime_returns, baseline_returns))
+    stats['brown_forsythe_stat_vs_pre_covid'] = [rec[0] for rec in bf_records]
+    stats['brown_forsythe_pvalue_vs_pre_covid'] = [rec[1] for rec in bf_records]
+    stats['variance_test_result'] = [rec[2] for rec in bf_records]
+
+    stats['reliability_label'] = stats['observations'].apply(reliability_label)
+    stats['sample_size_note'] = stats['reliability_label'].map({
+        "Early / low sample": "Interpret as preliminary because the regime has limited observations.",
+        "Moderate sample": "Interpret with moderate confidence.",
+        "Robust sample": "Estimate is supported by a relatively deep sample.",
+    })
+    stats['source_dataset'] = "event_analysis_df"
+    
+    # Sort and round
+    result = stats.sort_values('event_regime_code').reset_index(drop=True)
+    numeric_cols = result.select_dtypes(include=[np.number]).columns
+    pct_cols = [c for c in numeric_cols if 'pct' in c]
+    pvalue_cols = [c for c in numeric_cols if 'pvalue' in c]
+    other_numeric = [c for c in numeric_cols if c not in pct_cols and c not in pvalue_cols]
+    result[other_numeric] = result[other_numeric].round(6)
+    result[pct_cols] = result[pct_cols].round(2)
+    result[pvalue_cols] = result[pvalue_cols].round(4)
+    
+    return result
+
+
+def attach_event_regime_to_output(output_df: pd.DataFrame, feat_df: pd.DataFrame) -> pd.DataFrame:
+    if output_df.empty:
+        return output_df
+    
+    out_df = output_df.copy()
+    feat_copy = feat_df.copy()
+    out_df[DATE_COL] = pd.to_datetime(out_df[DATE_COL], errors='coerce')
+    feat_copy[DATE_COL] = pd.to_datetime(feat_copy[DATE_COL], errors='coerce')
+    
+    merge_cols = ['event_regime', 'event_regime_code', 'event_regime_description', 'covid_dummy', 'ukraine_war_dummy', 'us_tariff_dummy', 'iran_geopolitical_dummy', 'any_crisis_dummy']
+    available_cols = [c for c in merge_cols if c in feat_copy.columns]
+    
+    if available_cols:
+        out_df = out_df.merge(feat_copy[[DATE_COL] + available_cols], on=DATE_COL, how='left')
+    
+    return out_df
+
+
+def compute_event_regime_forecast_metrics(output_df: pd.DataFrame) -> pd.DataFrame:
+    if output_df.empty or 'event_regime' not in output_df.columns:
+        return pd.DataFrame()
+    
+    df = output_df.copy()
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors='coerce')
+    
+    pred_cols = ['naive_lag_observed', 'pred_garch_var', 'pred_ridge', 'pred_xgb', 'pred_blend']
+    available_preds = [c for c in pred_cols if c in df.columns]
+    
+    results = []
+    
+    for regime in df['event_regime'].unique():
+        regime_df = df[df['event_regime'] == regime]
+        if regime_df.empty:
+            continue
+        
+        regime_info = regime_df[['event_regime', 'event_regime_code', 'event_regime_description']].iloc[0]
+        crisis_flag = regime_df['any_crisis_dummy'].max() if 'any_crisis_dummy' in regime_df.columns else 0
+        
+        for model in available_preds:
+            model_df = regime_df.dropna(subset=['actual', model])
+            if len(model_df) < 5:
+                continue
+            
+            actual = model_df['actual']
+            pred = model_df[model]
+            
+            rmse = np.sqrt(mean_squared_error(actual, pred))
+            mae = mean_absolute_error(actual, pred)
+            bias = (pred - actual).mean()
+            qlike = qlike_from_vol_proxy(actual, pred, eps=EPS)
+            corr = _safe_corr(actual, pred)
+            
+            # R2 vs naive
+            if 'naive_lag_observed' in available_preds and model != 'naive_lag_observed':
+                naive_df = regime_df.dropna(subset=['actual', 'naive_lag_observed'])
+                if len(naive_df) >= 5:
+                    mse_model = mean_squared_error(actual, pred)
+                    mse_naive = mean_squared_error(naive_df['actual'], naive_df['naive_lag_observed'])
+                    r2_vs_naive = 1 - mse_model / mse_naive if mse_naive > 0 else np.nan
+                    rmse_naive = np.sqrt(mse_naive)
+                    rmse_red_pct = 100 * (rmse_naive - rmse) / rmse_naive if rmse_naive > 0 else np.nan
+                else:
+                    r2_vs_naive = np.nan
+                    rmse_red_pct = np.nan
+            else:
+                r2_vs_naive = np.nan
+                rmse_red_pct = np.nan
+            
+            results.append({
+                'event_regime': regime_info['event_regime'],
+                'event_regime_code': regime_info['event_regime_code'],
+                'event_regime_description': regime_info['event_regime_description'],
+                'model': model,
+                'observations': len(model_df),
+                'start_date': model_df[DATE_COL].min(),
+                'end_date': model_df[DATE_COL].max(),
+                'RMSE': rmse,
+                'MAE': mae,
+                'Bias': bias,
+                'QLIKE': qlike,
+                'Corr': corr,
+                'R2_vs_naive': r2_vs_naive,
+                'RMSE_red_pct_vs_naive': rmse_red_pct,
+                'crisis_flag': crisis_flag
+            })
+    
+    result = pd.DataFrame(results)
+    if not result.empty:
+        result = result.sort_values(['event_regime_code', 'model']).reset_index(drop=True)
+        # Rounding
+        result[['RMSE', 'MAE', 'Bias', 'QLIKE']] = result[['RMSE', 'MAE', 'Bias', 'QLIKE']].round(6)
+        result[['Corr', 'R2_vs_naive']] = result[['Corr', 'R2_vs_naive']].round(4)
+        result['RMSE_red_pct_vs_naive'] = result['RMSE_red_pct_vs_naive'].round(2)
+    
+    return result
+
+
+def qlike_from_vol_proxy(y_true: Any, y_pred: Any, eps: float = EPS) -> float:
+    realized_var = np.square(np.clip(np.asarray(y_true, dtype=float), eps, None))
+    forecast_var = np.square(np.clip(np.asarray(y_pred, dtype=float), eps, None))
+    ratio = realized_var / forecast_var
+    return float(np.mean(ratio - np.log(ratio) - 1.0))
+
+
+def compute_smearing_factor(y_log_true: Any, y_log_pred: Any) -> float:
+    resid = np.asarray(y_log_true, dtype=float) - np.asarray(y_log_pred, dtype=float)
+    factor = float(np.mean(np.exp(np.clip(resid, -20, 20))))
+    return max(factor, EPS)
+
+
+def level_from_log_with_smearing(pred_log: Any, smear_factor: float) -> np.ndarray:
+    pred_log = np.asarray(pred_log, dtype=float)
+    return np.maximum(np.exp(np.clip(pred_log, -50, 50)) * smear_factor - EPS, EPS)
+
+
+def build_sampled_xgb_configs(random_state: int = RANDOM_STATE, max_configs: int = XGB_MAX_CONFIGS_PER_WINDOW) -> List[Dict[str, Any]]:
+    from itertools import product
+
+    full_grid = list(
+        product(
+            [2, 3, 4, 5],
+            [0.01, 0.03, 0.05, 0.08],
+            [100, 200, 400],
+            [1, 3, 5],
+            [1.0, 5.0, 10.0],
+            [0.0, 0.5, 1.0],
+            [0.8, 1.0],
+            [0.8, 1.0],
+        )
+    )
+    rng = np.random.RandomState(random_state)
+    if len(full_grid) > max_configs:
+        chosen_idx = rng.choice(len(full_grid), size=max_configs, replace=False)
+        selected = [full_grid[i] for i in sorted(chosen_idx)]
+    else:
+        selected = full_grid
+
+    configs = []
+    for max_depth, learning_rate, n_estimators, min_child_weight, reg_lambda, reg_alpha, subsample, colsample_bytree in selected:
+        configs.append(
+            {
+                "max_depth": max_depth,
+                "learning_rate": learning_rate,
+                "n_estimators": n_estimators,
+                "min_child_weight": min_child_weight,
+                "reg_lambda": reg_lambda,
+                "reg_alpha": reg_alpha,
+                "subsample": subsample,
+                "colsample_bytree": colsample_bytree,
+                "n_jobs": XGB_N_JOBS,
+                "random_state": random_state,
+                "objective": "reg:squarederror",
+                "eval_metric": "rmse",
+                "tree_method": "hist",
+                "verbosity": 0,
+            }
+        )
+    return configs
+
+
+def safe_ljungbox_p(resid: Any, lag: int) -> float:
+    resid = np.asarray(resid, dtype=float)
+    if len(resid) <= lag + 1:
+        return np.nan
+    return float(acorr_ljungbox(resid, lags=[lag], return_df=True)["lb_pvalue"].values[0])
+
+
+def safe_arch_p(resid: Any, nlags: int = 5) -> float:
+    resid = np.asarray(resid, dtype=float)
+    if len(resid) <= nlags + 2:
+        return np.nan
+    _, pval, *_ = het_arch(resid, nlags=nlags)
+    return float(pval)
+
+
+def compute_global_metrics(y_true: Any, y_pred: Any, y_naive: Any, label: str) -> Dict[str, Any]:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    y_naive = np.asarray(y_naive, dtype=float)
+
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(y_true, y_pred))
+
+    mse_naive = mean_squared_error(y_true, y_naive)
+    r2_vs_naive = 1 - mse / mse_naive if mse_naive > EPS else np.nan
+    r2_classical = r2_score(y_true, y_pred)
+
+    bias = float(np.mean(y_pred - y_true))
+    mean_pred = float(np.mean(y_pred))
+    mean_actual = float(np.mean(y_true))
+    mean_pred_to_actual = mean_pred / (mean_actual + EPS)
+
+    qlike = qlike_from_vol_proxy(y_true, y_pred, eps=EPS)
+
+    if np.std(y_true) > EPS and np.std(y_pred) > EPS:
+        corr = float(np.corrcoef(y_true, y_pred)[0, 1])
+    else:
+        corr = np.nan
+
+    da = float(np.mean(np.sign(y_true - y_naive) == np.sign(y_pred - y_naive)))
+
+    resid = y_true - y_pred
+    lb1 = safe_ljungbox_p(resid, 1)
+    lb5 = safe_ljungbox_p(resid, 5)
+    lb22 = safe_ljungbox_p(resid, 22)
+    arch_p = safe_arch_p(resid, nlags=5)
+
+    return {
+        "Model": label,
+        "RMSE": round(rmse, 6),
+        "MAE": round(mae, 6),
+        "R2_vs_naive": round(r2_vs_naive, 4) if np.isfinite(r2_vs_naive) else np.nan,
+        "R2_classical": round(r2_classical, 4) if np.isfinite(r2_classical) else np.nan,
+        "Bias": round(bias, 6),
+        "MeanPred_to_Actual": round(mean_pred_to_actual, 4),
+        "QLIKE": round(qlike, 6),
+        "Corr": round(corr, 4) if np.isfinite(corr) else np.nan,
+        "DA": f"{da:.1%}",
+        "RMSE_red_pct": round(100 * (np.sqrt(mse_naive) - rmse) / np.sqrt(mse_naive), 1)
+        if mse_naive > EPS
+        else np.nan,
+        "LB1_p": round(lb1, 3) if np.isfinite(lb1) else np.nan,
+        "LB5_p": round(lb5, 3) if np.isfinite(lb5) else np.nan,
+        "LB22_p": round(lb22, 3) if np.isfinite(lb22) else np.nan,
+        "ARCH_p": round(arch_p, 4) if np.isfinite(arch_p) else np.nan,
+    }
+
+
+VOL_INDEX_DESCRIPTIONS = {
+    "Very Calm": {
+        "short_explanation": "USD/TND volatility is near the bottom of its historical range.",
+        "recommended_interpretation": "Short-term FX conditions look comparatively quiet, but liquidity gaps can still matter in frontier FX.",
+    },
+    "Normal": {
+        "short_explanation": "USD/TND volatility is close to its usual historical range.",
+        "recommended_interpretation": "Hedging and treasury decisions can be guided by normal risk controls, with routine monitoring.",
+    },
+    "Elevated": {
+        "short_explanation": "USD/TND volatility is above its typical historical range.",
+        "recommended_interpretation": "Short-term FX risk is building; hedging timing and exposure limits deserve closer attention.",
+    },
+    "High": {
+        "short_explanation": "USD/TND volatility is in the upper historical range.",
+        "recommended_interpretation": "Hedging sensitivity is elevated and short-term FX risk should be monitored closely.",
+    },
+    "Stress": {
+        "short_explanation": "USD/TND volatility is near the most stressed observations in the available history.",
+        "recommended_interpretation": "Risk conditions are unusually unstable; forecasts may change quickly and liquidity buffers matter.",
+    },
+}
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if np.isfinite(out) else default
+
+
+def _round_or_none(value: Any, digits: int = 6) -> Optional[float]:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(out):
+        return None
+    return round(out, digits)
+
+
+def _finite_array(values: Any) -> np.ndarray:
+    if values is None:
+        return np.array([], dtype=float)
+    arr = np.asarray(pd.Series(values), dtype=float)
+    return arr[np.isfinite(arr)]
+
+
+def _combined_reference(*series_list: Any) -> np.ndarray:
+    arrays = [_finite_array(series) for series in series_list]
+    arrays = [arr for arr in arrays if len(arr) > 0]
+    if not arrays:
+        return np.array([], dtype=float)
+    return np.concatenate(arrays)
+
+
+def percentile_rank_index(value: Any, reference_series: Any) -> float:
+    value_f = _safe_float(value, default=np.nan)
+    if not np.isfinite(value_f):
+        return 50.0
+
+    reference = _finite_array(reference_series)
+    if len(reference) == 0:
+        return 50.0
+
+    ref_min = float(np.min(reference))
+    ref_max = float(np.max(reference))
+    if ref_max - ref_min <= EPS:
+        if value_f > ref_max:
+            return 100.0
+        if value_f < ref_min:
+            return 0.0
+        return 50.0
+
+    if len(reference) < 20:
+        index_value = 100.0 * (value_f - ref_min) / (ref_max - ref_min)
+    else:
+        below = float(np.mean(reference < value_f))
+        equal = float(np.mean(np.isclose(reference, value_f, rtol=1e-8, atol=1e-12)))
+        index_value = 100.0 * (below + 0.5 * equal)
+
+    return round(float(np.clip(index_value, 0.0, 100.0)), 2)
+
+
+def classify_volatility_index(index_value: Any) -> Dict[str, Any]:
+    index_f = float(np.clip(_safe_float(index_value, default=50.0), 0.0, 100.0))
+    if index_f < 20:
+        label = "Very Calm"
+    elif index_f < 40:
+        label = "Normal"
+    elif index_f < 60:
+        label = "Elevated"
+    elif index_f < 80:
+        label = "High"
+    else:
+        label = "Stress"
+
+    text = VOL_INDEX_DESCRIPTIONS[label]
+    return {
+        "index_level": round(index_f, 2),
+        "classification_label": label,
+        "short_explanation": text["short_explanation"],
+        "recommended_interpretation": text["recommended_interpretation"],
+    }
+
+
+def _readable_feature_name(feature_name: str) -> str:
+    if feature_name in FEATURE_NAME_MAP:
+        return FEATURE_NAME_MAP[feature_name]
+    base = feature_name
+    if base.startswith("log_"):
+        base = base[4:]
+    if base.endswith("_lag1"):
+        base = base[:-5]
+    return base.replace("_", " ").strip().title()
+
+
+def compute_top_feature_importance(
+    xgb_feature_names: List[str],
+    xgb_importances: Any,
+    ridge_feature_names: Optional[List[str]] = None,
+    ridge_coefficients: Any = None,
+) -> List[Dict[str, Any]]:
+    scores: Dict[str, float] = {}
+    ridge_direction: Dict[str, str] = {}
+
+    xgb_arr = _finite_array(xgb_importances)
+    if len(xgb_arr) == len(xgb_feature_names) and len(xgb_arr) > 0:
+        denom = float(np.sum(np.abs(xgb_arr)))
+        if denom <= EPS:
+            denom = float(np.max(np.abs(xgb_arr))) + EPS
+        for feature, importance in zip(xgb_feature_names, xgb_arr):
+            scores[feature] = scores.get(feature, 0.0) + 0.7 * float(abs(importance) / denom)
+
+    if ridge_feature_names is not None and ridge_coefficients is not None:
+        ridge_arr = _finite_array(ridge_coefficients)
+        if len(ridge_arr) == len(ridge_feature_names) and len(ridge_arr) > 0:
+            denom = float(np.sum(np.abs(ridge_arr))) + EPS
+            for feature, coef in zip(ridge_feature_names, ridge_arr):
+                scores[feature] = scores.get(feature, 0.0) + 0.3 * float(abs(coef) / denom)
+                if coef > EPS:
+                    ridge_direction[feature] = "positive"
+                elif coef < -EPS:
+                    ridge_direction[feature] = "negative"
+
+    if not scores:
+        return []
+
+    total = sum(scores.values()) + EPS
+    rows = []
+    for feature, score in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:5]:
+        display_name = _readable_feature_name(feature)
+        direction = ridge_direction.get(feature, "nonlinear/mixed")
+        if direction == "positive":
+            direction_text = "Higher values were associated with a higher forecast in the Ridge component."
+        elif direction == "negative":
+            direction_text = "Higher values were associated with a lower forecast in the Ridge component."
+        else:
+            direction_text = "The nonlinear model used this feature in an interaction-driven way."
+        rows.append(
+            {
+                "technical_name": feature,
+                "feature_name": display_name,
+                "importance_score": round(100.0 * float(score) / total, 2),
+                "direction": direction,
+                "explanation": (
+                    f"{display_name} contributed to the model forecast. {direction_text} "
+                    "This is model influence, not proof of causality."
+                ),
+            }
+        )
+    return rows
+
+
+def build_volatility_index_history(dev_df: pd.DataFrame, holdout_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    if holdout_df.empty and dev_df.empty:
+        return []
+
+    initial_reference = _combined_reference(
+        dev_df.get("actual"),
+        dev_df.get("pred_blend"),
+        dev_df.get("pred_garch_var"),
+    )
+    source_df = holdout_df.copy()
+    if source_df.empty:
+        source_df = dev_df.copy()
+        initial_reference = _combined_reference(source_df.get("actual"), source_df.get("pred_blend"))
+
+    if DATE_COL in source_df.columns:
+        source_df = source_df.sort_values(DATE_COL)
+
+    reference = initial_reference.copy()
+    if len(reference) == 0:
+        reference = _combined_reference(source_df.get("actual"), source_df.get("pred_blend"))
+
+    records: List[Dict[str, Any]] = []
+    for _, row in source_df.iterrows():
+        pred = row.get("pred_blend")
+        actual = row.get("actual")
+        forecast_index = percentile_rank_index(pred, reference)
+        actual_index = percentile_rank_index(actual, reference)
+        classification = classify_volatility_index(forecast_index)
+
+        records.append(
+            {
+                "Date": row.get(DATE_COL),
+                "actual": _round_or_none(actual, 8),
+                "pred_blend": _round_or_none(pred, 8),
+                "volatility_index": forecast_index,
+                "actual_volatility_index": actual_index,
+                "classification_label": classification["classification_label"],
+                "explanation": classification["short_explanation"],
+            }
+        )
+
+        update_values = _finite_array(
+            [
+                row.get("actual"),
+                row.get("pred_blend"),
+                row.get("pred_garch_var"),
+            ]
+        )
+        if len(update_values) > 0:
+            reference = np.concatenate([reference, update_values]) if len(reference) > 0 else update_values
+
+    return records
+
+
+def _series_records(dates: pd.Series, values: pd.Series, value_name: str, limit: int = 500) -> List[Dict[str, Any]]:
+    frame = pd.DataFrame({DATE_COL: dates, value_name: values}).dropna().tail(limit)
+    return [
+        {DATE_COL: row[DATE_COL], value_name: _round_or_none(row[value_name], 8)}
+        for _, row in frame.iterrows()
+    ]
+
+
+def _regime_card(name: str, raw_value: Any, reference: Any, history_dates: pd.Series, history_values: pd.Series) -> Dict[str, Any]:
+    index_value = percentile_rank_index(raw_value, reference)
+    classification = classify_volatility_index(index_value)
+    return {
+        "raw_value": _round_or_none(raw_value, 8),
+        "index_value": index_value,
+        "percentile": index_value,
+        "classification_label": classification["classification_label"],
+        "explanation": f"{name} volatility is classified as {classification['classification_label']}. {classification['short_explanation']}",
+        "recommended_interpretation": classification["recommended_interpretation"],
+        "sparkline": _series_records(history_dates, history_values, "value", limit=120),
+    }
+
+
+def compute_regime_cards(feat_df: pd.DataFrame) -> Dict[str, Any]:
+    monthly_vol = realized_vol(feat_df[RET_COL], 22)
+    specs = {
+        "daily": ("Daily", feat_df["rv_usdtnd_1"]),
+        "weekly": ("Weekly", feat_df["rv_usdtnd_5"]),
+        "monthly": ("Monthly", monthly_vol),
+    }
+    cards: Dict[str, Any] = {}
+    for key, (label, series) in specs.items():
+        clean = pd.Series(series).replace([np.inf, -np.inf], np.nan)
+        latest = clean.dropna().iloc[-1] if clean.dropna().shape[0] > 0 else np.nan
+        reference = clean.dropna().iloc[:-1]
+        cards[key] = _regime_card(label, latest, reference, feat_df[DATE_COL], clean)
+    return cards
+
+
+def compute_model_weight_commentary(forecast_payload: Dict[str, Any], development_result: Dict[str, Any]) -> Dict[str, Any]:
+    xgb_weight = float(np.clip(_safe_float(forecast_payload.get("blend_weight_xgb"), 0.5), 0.0, 1.0))
+    ridge_weight = 1.0 - xgb_weight
+    regime_probability = float(np.clip(_safe_float(forecast_payload.get("regime_prob_high_vol"), 0.0), 0.0, 1.0))
+    base_xgb_weight = float(np.clip(_safe_float(development_result.get("final_blend_weight"), xgb_weight), 0.0, 1.0))
+    pred_ridge = _safe_float(forecast_payload.get("pred_ridge"), 0.0)
+    pred_xgb = _safe_float(forecast_payload.get("pred_xgb"), 0.0)
+
+    if regime_probability >= 0.5:
+        commentary = (
+            f"The system assigns {xgb_weight:.0%} weight to XGBoost and {ridge_weight:.0%} to Ridge because the "
+            "high-volatility regime probability is elevated. In stressed periods, the nonlinear XGBoost model receives "
+            "more weight because it can capture interactions between USD/TND volatility, global FX volatility, DXY, VIX, "
+            "MOVE, and commodity shocks."
+        )
+    else:
+        commentary = (
+            f"The system assigns {ridge_weight:.0%} weight to Ridge and {xgb_weight:.0%} to XGBoost because the market "
+            "is closer to normal conditions. In calmer regimes, the more stable linear model helps reduce overfitting risk."
+        )
+
+    return {
+        "ridge_weight": round(ridge_weight, 4),
+        "xgb_weight": round(xgb_weight, 4),
+        "base_xgb_weight": round(base_xgb_weight, 4),
+        "final_dynamic_xgb_weight": round(xgb_weight, 4),
+        "regime_probability": round(regime_probability, 4),
+        "ridge_contribution": round(ridge_weight * pred_ridge, 8),
+        "xgb_contribution": round(xgb_weight * pred_xgb, 8),
+        "commentary": commentary,
+    }
+
+
+def _find_metric_row(summary_df: pd.DataFrame, contains: str) -> Dict[str, Any]:
+    if summary_df.empty or "Model" not in summary_df.columns:
+        return {}
+    mask = summary_df["Model"].astype(str).str.contains(contains, case=False, regex=False)
+    if not mask.any():
+        return {}
+    return summary_df.loc[mask].iloc[0].to_dict()
+
+
+def compute_model_comparison(holdout_summary: pd.DataFrame, holdout_df: pd.DataFrame) -> Dict[str, Any]:
+    blend = _find_metric_row(holdout_summary, "Regime-Aware")
+    garch = {}
+    if "Model" in holdout_summary.columns:
+        garch_mask = holdout_summary["Model"].astype(str).str.contains("GARCH", case=False, regex=False)
+        if garch_mask.any():
+            garch = holdout_summary.loc[garch_mask].iloc[0].to_dict()
+
+    blend_rmse = _safe_float(blend.get("RMSE"), np.nan)
+    garch_rmse = _safe_float(garch.get("RMSE"), np.nan)
+    blend_mae = _safe_float(blend.get("MAE"), np.nan)
+    garch_mae = _safe_float(garch.get("MAE"), np.nan)
+
+    if np.isfinite(blend_rmse) and np.isfinite(garch_rmse):
+        if blend_rmse < garch_rmse:
+            tracking = "The regime-aware blend has a lower holdout RMSE than the selected GARCH benchmark."
+        elif blend_rmse > garch_rmse:
+            tracking = "The selected GARCH benchmark has a lower holdout RMSE than the regime-aware blend."
+        else:
+            tracking = "The regime-aware blend and selected GARCH benchmark have similar holdout RMSE."
+    else:
+        tracking = "Holdout metrics are not available for a clean model-vs-GARCH statement."
+
+    recent_comment = ""
+    if not holdout_df.empty and {"actual", "pred_blend"}.issubset(holdout_df.columns):
+        recent = holdout_df.tail(30)
+        recent_error = float(np.nanmean(recent["pred_blend"].astype(float) - recent["actual"].astype(float)))
+        if recent_error > EPS:
+            recent_comment = "Recently, the blended model has been modestly overestimating realized volatility."
+        elif recent_error < -EPS:
+            recent_comment = "Recently, the blended model has been modestly underestimating realized volatility."
+        else:
+            recent_comment = "Recently, the blended model has been broadly centered around realized volatility."
+
+    metric_text = ""
+    if np.isfinite(blend_rmse):
+        metric_text = f" Blend RMSE is {blend_rmse:.6f}"
+        if np.isfinite(blend_mae):
+            metric_text += f" and MAE is {blend_mae:.6f}."
+        else:
+            metric_text += "."
+    if np.isfinite(garch_rmse):
+        metric_text += f" The selected GARCH benchmark RMSE is {garch_rmse:.6f}"
+        if np.isfinite(garch_mae):
+            metric_text += f" and MAE is {garch_mae:.6f}."
+        else:
+            metric_text += "."
+
+    return {
+        "metrics": holdout_summary.to_dict(orient="records") if not holdout_summary.empty else [],
+        "commentary": " ".join(part for part in [tracking, recent_comment, metric_text] if part).strip(),
+    }
+
+
+def compute_garch_selection_commentary(
+    development_result: Dict[str, Any],
+    forecast_payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    selected = development_result.get("selected_garch_spec", {}).get("name", "Unknown")
+    live_anchor = (forecast_payload or {}).get("live_garch_anchor_used", selected)
+    live_fallback_triggered = bool((forecast_payload or {}).get("live_garch_fallback_triggered", False))
+    live_fallback_reason = (forecast_payload or {}).get("live_garch_fallback_reason")
+    gate = development_result.get("garch_gate", {})
+    base_m = gate.get("baseline", {})
+    primary_m = gate.get("primary", {})
+
+    base_rmse = _safe_float(base_m.get("RMSE"), np.nan)
+    base_qlike = _safe_float(base_m.get("QLIKE"), np.nan)
+    base_r2 = _safe_float(base_m.get("R2_vs_naive"), np.nan)
+    primary_rmse = _safe_float(primary_m.get("RMSE"), np.nan)
+    primary_qlike = _safe_float(primary_m.get("QLIKE"), np.nan)
+    primary_r2 = _safe_float(primary_m.get("R2_vs_naive"), np.nan)
+
+    primary_not_worse = (
+        np.isfinite(base_rmse)
+        and np.isfinite(primary_rmse)
+        and primary_rmse <= base_rmse + NO_WORSE_TOL
+        and primary_qlike <= base_qlike + NO_WORSE_TOL
+        and primary_r2 + NO_WORSE_TOL >= base_r2
+    )
+
+    if selected == PRIMARY_GARCH_SPEC["name"]:
+        reason = "EGARCH-t passed the configured no-worse tolerance rule versus GARCH-normal."
+        commentary = (
+            "EGARCH-t was selected because it was not worse than the GARCH-normal benchmark under the tolerance rule "
+            "and is more suitable for FX volatility because it can capture asymmetric volatility responses and fat-tailed return shocks."
+        )
+        decision = "Primary accepted" if primary_not_worse else "Primary used by fallback/default rule"
+    elif selected == BASELINE_GARCH_SPEC["name"]:
+        reason = "EGARCH-t did not improve the benchmark metrics within the configured tolerance."
+        commentary = (
+            "GARCH-normal was selected because EGARCH-t did not improve the benchmark metrics within the configured tolerance. "
+            "The simpler model is preferred to avoid unnecessary complexity."
+        )
+        decision = "Baseline retained"
+    else:
+        reason = "The ARCH fit fell back to a robust volatility proxy."
+        commentary = (
+            f"{selected} was used because the configured ARCH candidates could not produce a stable forecast for this run."
+        )
+        decision = "Fallback used"
+
+    if live_fallback_triggered:
+        commentary = (
+            f"{commentary} The selected validation benchmark was {selected}. The live production anchor used for this "
+            f"forecast was {live_anchor}. The live production anchor may fall back to EWMA if ARCH-based fitting fails "
+            "or produces implausible forecasts. EWMA is retained as a robust operational fallback."
+        )
+        if live_fallback_reason:
+            commentary = f"{commentary} Fallback reason: {live_fallback_reason}"
+
+    comparison = []
+    for label, metrics in [(BASELINE_GARCH_SPEC["name"], base_m), (PRIMARY_GARCH_SPEC["name"], primary_m)]:
+        row = {"Model": label}
+        for key in ["RMSE", "MAE", "QLIKE", "R2_vs_naive", "Bias", "Corr"]:
+            row[key] = metrics.get(key)
+        comparison.append(row)
+
+    return {
+        "selected_model": selected,
+        "selected_validation_benchmark": selected,
+        "live_garch_anchor_used": live_anchor,
+        "live_garch_fallback_triggered": live_fallback_triggered,
+        "live_garch_fallback_reason": live_fallback_reason,
+        "tolerance": NO_WORSE_TOL,
+        "decision_result": decision,
+        "reason": reason,
+        "comparison": comparison,
+        "commentary": commentary,
+        "tolerance_rule": (
+            "EGARCH-t is selected only when its RMSE and QLIKE are no worse than GARCH-normal within the tolerance, "
+            "and its R2_vs_naive is no lower within the same tolerance."
+        ),
+    }
+
+
+def compute_calendar_effects(feat_df: pd.DataFrame) -> Dict[str, Any]:
+    cal = feat_df[[DATE_COL, "rv_usdtnd_1"]].dropna().copy()
+    if cal.empty:
+        return {"month_average_vol": [], "day_of_week_average_vol": [], "heatmap_matrix": [], "commentary": ""}
+
+    cal["month"] = cal[DATE_COL].dt.month
+    cal["month_name"] = cal[DATE_COL].dt.strftime("%b")
+    cal["day_of_week"] = cal[DATE_COL].dt.day_name()
+    day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+    month_avg = (
+        cal.groupby(["month", "month_name"], as_index=False)["rv_usdtnd_1"]
+        .mean()
+        .sort_values("month")
+        .rename(columns={"rv_usdtnd_1": "average_volatility"})
+    )
+    day_avg = (
+        cal.groupby("day_of_week", as_index=False)["rv_usdtnd_1"]
+        .mean()
+        .rename(columns={"rv_usdtnd_1": "average_volatility"})
+    )
+    day_avg["day_order"] = day_avg["day_of_week"].map({day: idx for idx, day in enumerate(day_order)})
+    day_avg = day_avg.sort_values("day_order").drop(columns=["day_order"])
+
+    heat = (
+        cal.pivot_table(index="month_name", columns="day_of_week", values="rv_usdtnd_1", aggfunc="mean")
+        .reindex(month_avg["month_name"].tolist())
+        .reindex(columns=day_order)
+    )
+    heat_records = []
+    for month_name, row in heat.iterrows():
+        for day_name in day_order:
+            heat_records.append(
+                {
+                    "month": month_name,
+                    "day_of_week": day_name,
+                    "average_volatility": _round_or_none(row.get(day_name), 8),
+                }
+            )
+
+    high_month = month_avg.sort_values("average_volatility", ascending=False).iloc[0]["month_name"]
+    high_day = day_avg.sort_values("average_volatility", ascending=False).iloc[0]["day_of_week"]
+    commentary = (
+        f"Historically, {high_month} and {high_day}s show the highest average 1-day USD/TND realized volatility in this sample. "
+        "Calendar effects are descriptive patterns, not guaranteed forecasts."
+    )
+
+    return {
+        "month_average_vol": month_avg.to_dict(orient="records"),
+        "day_of_week_average_vol": day_avg.to_dict(orient="records"),
+        "heatmap_matrix": heat_records,
+        "commentary": commentary,
+    }
+
+
+def compute_weekly_monthly_volatility(feat_df: pd.DataFrame) -> Dict[str, Any]:
+    weekly = feat_df["rv_usdtnd_5"].replace([np.inf, -np.inf], np.nan)
+    monthly = realized_vol(feat_df[RET_COL], 22).replace([np.inf, -np.inf], np.nan)
+
+    latest_weekly_value = weekly.dropna().iloc[-1] if weekly.dropna().shape[0] > 0 else np.nan
+    latest_monthly_value = monthly.dropna().iloc[-1] if monthly.dropna().shape[0] > 0 else np.nan
+
+    latest_weekly = _regime_card("Weekly", latest_weekly_value, weekly.dropna().iloc[:-1], feat_df[DATE_COL], weekly)
+    latest_monthly = _regime_card("Monthly", latest_monthly_value, monthly.dropna().iloc[:-1], feat_df[DATE_COL], monthly)
+
+    if np.isfinite(_safe_float(latest_weekly_value, np.nan)) and np.isfinite(_safe_float(latest_monthly_value, np.nan)):
+        if latest_weekly_value > latest_monthly_value:
+            commentary = (
+                "Weekly volatility is above monthly volatility, suggesting short-term FX risk is running hotter than the medium-term backdrop. "
+                "If monthly volatility remains lower, the move may be temporary rather than a persistent regime shift."
+            )
+        elif latest_weekly_value < latest_monthly_value:
+            commentary = (
+                "Weekly volatility is below monthly volatility, suggesting recent conditions are calmer than the medium-term regime."
+            )
+        else:
+            commentary = "Weekly and monthly volatility are broadly aligned, pointing to a stable near-term risk profile."
+    else:
+        commentary = "Weekly/monthly volatility comparison is limited by missing realized-volatility history."
+
+    return {
+        "weekly": _series_records(feat_df[DATE_COL], weekly, "weekly_volatility", limit=500),
+        "monthly": _series_records(feat_df[DATE_COL], monthly, "monthly_volatility", limit=500),
+        "latest_weekly": latest_weekly,
+        "latest_monthly": latest_monthly,
+        "commentary": commentary,
+    }
+
+
+def compute_volatility_of_volatility(feat_df: pd.DataFrame) -> Dict[str, Any]:
+    rv = feat_df["rv_usdtnd_1"].replace([np.inf, -np.inf], np.nan)
+    vov_5 = rv.rolling(5, min_periods=5).std()
+    vov_22 = rv.rolling(22, min_periods=22).std()
+    latest_value = vov_22.dropna().iloc[-1] if vov_22.dropna().shape[0] > 0 else (
+        vov_5.dropna().iloc[-1] if vov_5.dropna().shape[0] > 0 else np.nan
+    )
+    reference = vov_22.dropna().iloc[:-1] if vov_22.dropna().shape[0] > 1 else vov_5.dropna().iloc[:-1]
+    index_value = percentile_rank_index(latest_value, reference)
+    classification = classify_volatility_index(index_value)
+
+    history = pd.DataFrame(
+        {
+            DATE_COL: feat_df[DATE_COL],
+            "vol_of_vol_5d": vov_5,
+            "vol_of_vol_22d": vov_22,
+        }
+    ).dropna(how="all", subset=["vol_of_vol_5d", "vol_of_vol_22d"]).tail(500)
+
+    if classification["classification_label"] in {"High", "Stress"}:
+        commentary = "Volatility of volatility is high, meaning risk conditions are unstable and forecasts may change quickly."
+    elif classification["classification_label"] == "Very Calm":
+        commentary = "Volatility of volatility is low, meaning volatility conditions are comparatively stable."
+    else:
+        commentary = "Volatility of volatility is in a normal-to-elevated range, so forecast uncertainty should still be monitored."
+
+    return {
+        "history": [
+            {
+                DATE_COL: row[DATE_COL],
+                "vol_of_vol_5d": _round_or_none(row.get("vol_of_vol_5d"), 8),
+                "vol_of_vol_22d": _round_or_none(row.get("vol_of_vol_22d"), 8),
+            }
+            for _, row in history.iterrows()
+        ],
+        "latest": {
+            "raw_value": _round_or_none(latest_value, 8),
+            "index_value": index_value,
+            "classification_label": classification["classification_label"],
+            "explanation": classification["short_explanation"],
+        },
+        "commentary": commentary,
+    }
+
+
+def compute_global_fx_comparison(feat_df: pd.DataFrame) -> Dict[str, Any]:
+    fx_cols = [col for col in ["rv_eurusd_1", "rv_gbpusd_1", "rv_usdjpy_1", "rv_dxy_1"] if col in feat_df.columns]
+    if not fx_cols:
+        return {"history": [], "latest": {}, "commentary": "Global FX comparison is unavailable because proxy columns are missing."}
+
+    global_fx_mean = feat_df[fx_cols].mean(axis=1)
+    local_vol = feat_df["rv_usdtnd_1"]
+    ratio = local_vol / (global_fx_mean + EPS)
+    spread = local_vol - global_fx_mean
+
+    latest_ratio = _safe_float(ratio.dropna().iloc[-1] if ratio.dropna().shape[0] > 0 else np.nan, np.nan)
+    if not np.isfinite(latest_ratio):
+        label = "Unavailable"
+    elif latest_ratio < 0.8:
+        label = "USD/TND quieter than global FX"
+    elif latest_ratio < 1.2:
+        label = "USD/TND in line with global FX"
+    elif latest_ratio < 2.0:
+        label = "USD/TND more volatile than global FX"
+    else:
+        label = "USD/TND significantly more volatile than global FX"
+
+    if label == "USD/TND quieter than global FX":
+        commentary = "USD/TND volatility is currently below the average of major global FX proxies."
+    elif label == "USD/TND in line with global FX":
+        commentary = "USD/TND volatility is currently broadly aligned with the average of major global FX proxies."
+    elif label == "Unavailable":
+        commentary = "USD/TND versus global FX comparison is limited by missing data."
+    else:
+        commentary = (
+            "USD/TND volatility is currently above the average of major global FX pairs. This suggests local currency risk is not only being "
+            "driven by broad dollar conditions but may also reflect local or regional dynamics."
+        )
+
+    history = pd.DataFrame(
+        {
+            DATE_COL: feat_df[DATE_COL],
+            "usdtnd_volatility": local_vol,
+            "global_fx_mean": global_fx_mean,
+            "ratio": ratio,
+            "spread": spread,
+        }
+    ).replace([np.inf, -np.inf], np.nan).dropna(subset=["usdtnd_volatility", "global_fx_mean"]).tail(500)
+
+    return {
+        "history": [
+            {
+                DATE_COL: row[DATE_COL],
+                "usdtnd_volatility": _round_or_none(row.get("usdtnd_volatility"), 8),
+                "global_fx_mean": _round_or_none(row.get("global_fx_mean"), 8),
+                "ratio": _round_or_none(row.get("ratio"), 4),
+                "spread": _round_or_none(row.get("spread"), 8),
+            }
+            for _, row in history.iterrows()
+        ],
+        "latest": {
+            "usdtnd_volatility": _round_or_none(local_vol.dropna().iloc[-1] if local_vol.dropna().shape[0] > 0 else np.nan, 8),
+            "global_fx_mean": _round_or_none(global_fx_mean.dropna().iloc[-1] if global_fx_mean.dropna().shape[0] > 0 else np.nan, 8),
+            "ratio": _round_or_none(latest_ratio, 4),
+            "spread": _round_or_none(spread.dropna().iloc[-1] if spread.dropna().shape[0] > 0 else np.nan, 8),
+            "classification": label,
+        },
+        "commentary": commentary,
+    }
+
+
+def build_dashboard_history(holdout_df: pd.DataFrame, index_history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if holdout_df.empty:
+        return []
+
+    history = holdout_df.copy()
+    index_df = pd.DataFrame(index_history)
+    if not index_df.empty and DATE_COL in index_df.columns:
+        index_df[DATE_COL] = pd.to_datetime(index_df[DATE_COL])
+        history[DATE_COL] = pd.to_datetime(history[DATE_COL])
+        history = history.merge(
+            index_df[[DATE_COL, "volatility_index", "classification_label"]],
+            on=DATE_COL,
+            how="left",
+        )
+    else:
+        history["volatility_index"] = np.nan
+        history["classification_label"] = None
+
+    history["model_error"] = history["pred_blend"] - history["actual"]
+    records = []
+    for _, row in history.iterrows():
+        records.append(
+            {
+                DATE_COL: row.get(DATE_COL),
+                "actual_volatility": _round_or_none(row.get("actual"), 8),
+                "predicted_volatility": _round_or_none(row.get("pred_blend"), 8),
+                "volatility_index": _round_or_none(row.get("volatility_index"), 2),
+                "regime_label": row.get("classification_label"),
+                "garch_forecast": _round_or_none(row.get("pred_garch_var"), 8),
+                "naive_forecast": _round_or_none(row.get("naive_lag_observed"), 8),
+                "model_error": _round_or_none(row.get("model_error"), 8),
+                "high_vol_probability": _round_or_none(row.get("prob_high_vol"), 4),
+            }
+        )
+    return records
+
+
+def build_dashboard_summary(
+    forecast_payload: Dict[str, Any],
+    volatility_current: Dict[str, Any],
+    garch_selection: Dict[str, Any],
+    top_features: List[Dict[str, Any]],
+) -> str:
+    label = volatility_current.get("classification_label", "Unknown")
+    index_value = volatility_current.get("value", volatility_current.get("index_level", 50.0))
+    raw_forecast = forecast_payload.get("final_forecast_blend")
+    p05 = forecast_payload.get("forecast_p05")
+    p95 = forecast_payload.get("forecast_p95")
+    high_prob = forecast_payload.get("regime_prob_high_vol")
+    horizon = forecast_payload.get("horizon_days", VOL_TARGET_WINDOW)
+    forecast_date = forecast_payload.get("forecast_date")
+    selected_garch = garch_selection.get("selected_validation_benchmark", forecast_payload.get("selected_garch_benchmark", "the selected validation benchmark"))
+    live_anchor = forecast_payload.get("live_garch_anchor_used", forecast_payload.get("garch_spec_used", selected_garch))
+    drivers = ", ".join(feature["feature_name"] for feature in top_features[:3]) if top_features else "recent USD/TND and global market volatility inputs"
+
+    return (
+        f"As of {forecast_date}, the model forecasts USD/TND volatility over the next {horizon} trading days at {raw_forecast}. "
+        f"The USD/TND Volatility Index stands at {index_value}/100, placing the market in a {label} volatility regime. "
+        f"The model-implied 90% interval is {p05} to {p95}, with a high-volatility probability of {high_prob}. "
+        f"The selected validation benchmark is {selected_garch}; the live production anchor used here is {live_anchor}. "
+        "The live production anchor may fall back to EWMA if ARCH-based fitting fails or produces implausible forecasts. "
+        f"Main model drivers include {drivers}. "
+        "This is a historically grounded risk signal, not a guarantee of future spot moves."
+    )
+
+
+def build_dashboard_payload(
+    feat_df: pd.DataFrame,
+    development_result: Dict[str, Any],
+    holdout_result: Dict[str, Any],
+    dev_df_out: pd.DataFrame,
+    holdout_df_out: pd.DataFrame,
+    summary_dev_df: pd.DataFrame,
+    summary_holdout_df: pd.DataFrame,
+    forecast_payload: Dict[str, Any],
+    live_model_details: Dict[str, Any],
+) -> Dict[str, Any]:
+    historical_reference = _combined_reference(
+        dev_df_out.get("actual"),
+        dev_df_out.get("pred_blend"),
+        dev_df_out.get("pred_garch_var"),
+        holdout_df_out.get("actual"),
+        holdout_df_out.get("pred_blend"),
+        holdout_df_out.get("pred_garch_var"),
+        feat_df.get("rv_usdtnd_1"),
+    )
+
+    current_index_value = percentile_rank_index(
+        forecast_payload.get("final_forecast_blend"),
+        historical_reference,
+    )
+    current_classification = classify_volatility_index(current_index_value)
+    volatility_current = {
+        "value": current_index_value,
+        "classification": current_classification["classification_label"],
+        "classification_label": current_classification["classification_label"],
+        "explanation": current_classification["short_explanation"],
+        "short_explanation": current_classification["short_explanation"],
+        "recommended_interpretation": current_classification["recommended_interpretation"],
+        "raw_forecast": forecast_payload.get("final_forecast_blend"),
+        "forecast_p05": forecast_payload.get("forecast_p05"),
+        "forecast_p95": forecast_payload.get("forecast_p95"),
+    }
+
+    volatility_index_history = build_volatility_index_history(dev_df_out, holdout_df_out)
+    model_weights = compute_model_weight_commentary(forecast_payload, development_result)
+    model_comparison = compute_model_comparison(summary_holdout_df, holdout_df_out)
+    garch_selection = compute_garch_selection_commentary(development_result, forecast_payload)
+    top_features = live_model_details.get("feature_importance_top_5", [])
+    dashboard_history = build_dashboard_history(holdout_df_out, volatility_index_history)
+
+    dashboard = {
+        "volatility_index": {
+            "current": volatility_current,
+            "history": volatility_index_history,
+            "thresholds": [
+                {"range": "0-20", "classification_label": "Very Calm", **VOL_INDEX_DESCRIPTIONS["Very Calm"]},
+                {"range": "20-40", "classification_label": "Normal", **VOL_INDEX_DESCRIPTIONS["Normal"]},
+                {"range": "40-60", "classification_label": "Elevated", **VOL_INDEX_DESCRIPTIONS["Elevated"]},
+                {"range": "60-80", "classification_label": "High", **VOL_INDEX_DESCRIPTIONS["High"]},
+                {"range": "80-100", "classification_label": "Stress", **VOL_INDEX_DESCRIPTIONS["Stress"]},
+            ],
+        },
+        "regime": compute_regime_cards(feat_df),
+        "model_weights": model_weights,
+        "model_comparison": model_comparison,
+        "garch_selection": garch_selection,
+        "feature_importance": {
+            "top_5": top_features,
+            "commentary": (
+                "These features were influential in the trained model for this forecast. "
+                "They should be read as model drivers, not causal proof."
+            ),
+        },
+        "calendar_effect": compute_calendar_effects(feat_df),
+        "weekly_monthly_volatility": compute_weekly_monthly_volatility(feat_df),
+        "volatility_of_volatility": compute_volatility_of_volatility(feat_df),
+        "global_fx_comparison": compute_global_fx_comparison(feat_df),
+        "history": dashboard_history,
+        "summary": "",
+    }
+    dashboard["summary"] = build_dashboard_summary(
+        forecast_payload,
+        volatility_current,
+        garch_selection,
+        top_features,
+    )
+    return dashboard
+
+
+def _ewma_vol_forecast(returns: Any, horizon: int, vol_window: int, lam: float = 0.94) -> Tuple[np.ndarray, np.ndarray, str]:
+    ret = np.asarray(returns, dtype=float)
+    ewma_var = float(ret[-1] ** 2)
+    for r in ret[-250:]:
+        ewma_var = lam * ewma_var + (1 - lam) * r**2
+    vol_1d = np.sqrt(max(ewma_var, EPS))
+    vol_nd = vol_1d * np.sqrt(vol_window)
+    forecasts = np.full(horizon, vol_nd, dtype=float)
+
+    n = len(ret)
+    cond_var = np.zeros(n)
+    cond_var[0] = ret[0] ** 2
+    for t in range(1, n):
+        cond_var[t] = lam * cond_var[t - 1] + (1 - lam) * ret[t - 1] ** 2
+    cond_vol = np.sqrt(np.maximum(cond_var, EPS))
+    return forecasts, cond_vol, "EWMA"
+
+
+def _arch_model_factory():
+    try:
+        from arch import arch_model
+    except ImportError as exc:
+        raise ImportError("Missing dependency 'arch'. Install it with: pip install arch") from exc
+    return arch_model
+
+
+def garch_forward_vol_forecast_robust(
+    returns_train: Any,
+    horizon: int,
+    vol_window: int,
+    primary_spec: Dict[str, Any],
+    fallback_specs: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[np.ndarray, np.ndarray, str, Dict[str, Any]]:
+    if fallback_specs is None:
+        fallback_specs = []
+    all_specs = [primary_spec] + list(fallback_specs)
+    ret = np.asarray(returns_train, dtype=float)
+    attempted_specs: List[str] = []
+    failure_reasons: Dict[str, str] = {}
+
+    try:
+        arch_model = _arch_model_factory()
+    except Exception as exc:
+        forecasts, cond_vol, spec_name = _ewma_vol_forecast(ret, horizon, vol_window)
+        fallback_info = {
+            "requested_primary_spec": primary_spec["name"],
+            "anchor_used": spec_name,
+            "fallback_triggered": True,
+            "fallback_reason": f"ARCH model factory unavailable: {exc}; EWMA fallback used.",
+            "attempted_specs": attempted_specs,
+            "failure_reasons": failure_reasons,
+        }
+        return forecasts, cond_vol, spec_name, fallback_info
+
+    for spec in all_specs:
+        attempted_specs.append(spec["name"])
+        try:
+            am = arch_model(
+                ret * 100.0,
+                mean=spec["mean"],
+                vol=spec["vol"],
+                p=spec["p"],
+                o=spec["o"],
+                q=spec["q"],
+                dist=spec["dist"],
+            )
+            res = am.fit(disp="off", show_warning=False, options={"maxiter": 500})
+            fc = res.forecast(horizon=horizon + vol_window - 1, reindex=False)
+            var_path = np.maximum(fc.variance.values[-1], 0.0) / (100.0**2)
+            forecasts = np.array(
+                [
+                    np.sqrt(max(float(np.sum(var_path[j : j + vol_window])), EPS))
+                    for j in range(horizon)
+                ],
+                dtype=float,
+            )
+            if not (np.all(np.isfinite(forecasts)) and np.all(forecasts > 0) and np.max(forecasts) < 1.0):
+                raise ValueError(f"Implausible forecast from {spec['name']}")
+            cond_vol = res.conditional_volatility.values / 100.0
+            fallback_info = {
+                "requested_primary_spec": primary_spec["name"],
+                "anchor_used": spec["name"],
+                "fallback_triggered": spec["name"] != primary_spec["name"],
+                "fallback_reason": (
+                    None
+                    if spec["name"] == primary_spec["name"]
+                    else f"{primary_spec['name']} failed; {spec['name']} fallback used."
+                ),
+                "attempted_specs": attempted_specs,
+                "failure_reasons": failure_reasons,
+            }
+            return forecasts, cond_vol, spec["name"], fallback_info
+        except Exception as exc:
+            failure_reasons[spec["name"]] = str(exc)
+            continue
+
+    forecasts, cond_vol, spec_name = _ewma_vol_forecast(ret, horizon, vol_window)
+    fallback_info = {
+        "requested_primary_spec": primary_spec["name"],
+        "anchor_used": spec_name,
+        "fallback_triggered": True,
+        "fallback_reason": "All ARCH specifications failed or produced implausible forecasts; EWMA fallback used.",
+        "attempted_specs": attempted_specs,
+        "failure_reasons": failure_reasons,
+    }
+    return forecasts, cond_vol, spec_name, fallback_info
+
+
+def garch_forward_vol_forecast(returns_train: Any, horizon: int, vol_window: int, spec: Dict[str, Any]) -> np.ndarray:
+    forecasts, _, _, _fallback_info = garch_forward_vol_forecast_robust(
+        returns_train,
+        horizon,
+        vol_window,
+        spec,
+        fallback_specs=[],
+    )
+    return forecasts
+
+
+def design_split_and_features(
+    feat_df: pd.DataFrame,
+    feature_cols: List[str],
+    progress_callback: ProgressCallback = None,
+) -> Dict[str, Any]:
+    max_date = feat_df[DATE_COL].max()
+    holdout_start_date = max_date - pd.DateOffset(years=HOLDOUT_YEARS)
+    holdout_mask = feat_df[DATE_COL] >= holdout_start_date
+    if not holdout_mask.any():
+        raise ValueError("Could not create holdout split.")
+
+    holdout_start_idx = int(np.flatnonzero(holdout_mask.values)[0])
+    min_holdout_start = SPLIT + STEP_SIZE
+    if holdout_start_idx < min_holdout_start:
+        holdout_start_idx = min_holdout_start
+        holdout_start_date = feat_df[DATE_COL].iloc[holdout_start_idx]
+
+    if holdout_start_idx >= len(feat_df) - STEP_SIZE:
+        raise ValueError("Holdout split too small. Increase data length or reduce STEP_SIZE.")
+
+    fixed_event_threshold = float(
+        np.percentile(
+            feat_df[TARGET_COL].iloc[:holdout_start_idx].values,
+            CLASSIFIER_TOP_PERCENTILE,
+        )
+    )
+
+    coefs_history = []
+    sc_audit = StandardScaler()
+    audit_window = 250
+
+    for i in range(audit_window, holdout_start_idx, STEP_SIZE):
+        ts = max(0, i - audit_window)
+        X_f = np.nan_to_num(
+            feat_df[feature_cols].iloc[ts:i].values.astype(float),
+            nan=0,
+            posinf=0,
+            neginf=0,
+        )
+        y_f = feat_df["log_target"].iloc[ts:i].values.astype(float)
+        if len(y_f) < 60:
+            continue
+        X_f, _ = winsorise(X_f, X_f)
+        X_f_s = sc_audit.fit_transform(X_f)
+        m = Ridge(alpha=10.0).fit(X_f_s, y_f)
+        coefs_history.append(m.coef_)
+
+    if len(coefs_history) == 0:
+        stable_features_ridge = feature_cols[: min(RIDGE_STABLE_FEATURE_COUNT, len(feature_cols))]
+        stable_features_broad = feature_cols[: min(BROAD_FEATURE_COUNT, len(feature_cols))]
+    else:
+        coefs_mat = np.array(coefs_history)
+        mean_c = np.mean(coefs_mat, axis=0)
+        std_c = np.std(coefs_mat, axis=0) + EPS
+        stability = np.abs(mean_c) / std_c
+
+        ridge_k = min(RIDGE_STABLE_FEATURE_COUNT, len(feature_cols))
+        broad_k = min(BROAD_FEATURE_COUNT, len(feature_cols))
+        stable_rank = np.argsort(stability)
+
+        stable_features_ridge = [feature_cols[idx] for idx in stable_rank[-ridge_k:]]
+        stable_features_broad = [feature_cols[idx] for idx in stable_rank[-broad_k:]]
+
+    emit(progress_callback, f"Frozen stable features: Ridge={len(stable_features_ridge)} Broad={len(stable_features_broad)}")
+
+    # Ensure event-aware features are preserved in selected feature subsets.
+    # Event dummies and interactions are calendar-known model inputs; event
+    # labels and event_regime_code remain reporting/diagnostic fields.
+    stable_features_ridge = ensure_event_features_in_selected_features(
+        stable_features_ridge,
+        feature_cols,
+        max_feature_count=None,
+    )
+    stable_features_broad = ensure_event_features_in_selected_features(
+        stable_features_broad,
+        feature_cols,
+        max_feature_count=None,
+    )
+
+    emit(progress_callback, f"Event-aware features added: Ridge={len(stable_features_ridge)} Broad={len(stable_features_broad)}")
+
+    # Track which event features are available and selected
+    event_features_available = [c for c in (EVENT_DUMMY_COLUMNS + EVENT_INTERACTION_COLUMNS) if c in feature_cols]
+    event_features_in_ridge = [c for c in event_features_available if c in stable_features_ridge]
+    event_features_in_broad = [c for c in event_features_available if c in stable_features_broad]
+
+    return {
+        "holdout_start_idx": holdout_start_idx,
+        "holdout_start_date": holdout_start_date,
+        "fixed_event_threshold": fixed_event_threshold,
+        "stable_features_ridge": stable_features_ridge,
+        "stable_features_broad": stable_features_broad,
+        "event_features_available": event_features_available,
+        "event_features_in_ridge": event_features_in_ridge,
+        "event_features_in_broad": event_features_in_broad,
+    }
+
+
+def _make_xgb_classifier(scale_pos_weight: float) -> XGBClassifier:
+    return XGBClassifier(
+        max_depth=3,
+        learning_rate=0.05,
+        n_estimators=300,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=5.0,
+        reg_alpha=1.0,
+        min_child_weight=3,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=RANDOM_STATE,
+        n_jobs=XGB_N_JOBS,
+        scale_pos_weight=scale_pos_weight,
+        tree_method="hist",
+        verbosity=0,
+    )
+
+
+def run_development_walk_forward(
+    feat_df: pd.DataFrame,
+    holdout_start_idx: int,
+    fixed_event_threshold: float,
+    stable_features_ridge: List[str],
+    stable_features_broad: List[str],
+    progress_callback: ProgressCallback = None,
+) -> Dict[str, Any]:
+    xgb_search_configs = build_sampled_xgb_configs(RANDOM_STATE, XGB_MAX_CONFIGS_PER_WINDOW)
+    ts_cv = TimeSeriesSplit(n_splits=3)
+
+    preds_ridge_dev: List[float] = []
+    preds_xgb_dev: List[float] = []
+    preds_blend_dev: List[float] = []
+    preds_garch_dev_baseline: List[float] = []
+    preds_garch_dev_primary: List[float] = []
+    acts_dev: List[float] = []
+    dates_dev: List[pd.Timestamp] = []
+    idx_dev: List[int] = []
+    preds_blend_low_dev: List[float] = []
+    preds_blend_high_dev: List[float] = []
+    preds_class_prob_dev: List[float] = []
+    class_actuals_dev: List[int] = []
+    preds_dynamic_weight_dev: List[float] = []
+
+    selected_ridge_alphas: List[float] = []
+    selected_blend_weights: List[float] = []
+    selected_xgb_keys: List[Tuple[Tuple[str, Any], ...]] = []
+
+    dev_windows = list(range(SPLIT, holdout_start_idx, STEP_SIZE))
+    emit(progress_callback, f"Development windows: {len(dev_windows)}")
+
+    for win_idx, i in enumerate(dev_windows):
+        ts = max(0, i - ROLLING_WINDOW)
+        pe = min(i + STEP_SIZE, holdout_start_idx)
+        h = pe - i
+        train_end = i - LABEL_GAP
+
+        if h <= 0 or train_end <= ts + 100:
+            continue
+
+        y_log_w = feat_df["log_target"].iloc[ts:train_end].values.astype(float)
+        y_test = feat_df[TARGET_COL].iloc[i:pe].values.astype(float)
+
+        X_fit_raw_ridge = np.nan_to_num(
+            feat_df[stable_features_ridge].iloc[ts:train_end].values.astype(float),
+            nan=0,
+            posinf=0,
+            neginf=0,
+        )
+        X_test_raw_ridge = np.nan_to_num(
+            feat_df[stable_features_ridge].iloc[i:pe].values.astype(float),
+            nan=0,
+            posinf=0,
+            neginf=0,
+        )
+
+        X_fit_raw_broad = np.nan_to_num(
+            feat_df[stable_features_broad].iloc[ts:train_end].values.astype(float),
+            nan=0,
+            posinf=0,
+            neginf=0,
+        )
+        X_test_raw_broad = np.nan_to_num(
+            feat_df[stable_features_broad].iloc[i:pe].values.astype(float),
+            nan=0,
+            posinf=0,
+            neginf=0,
+        )
+
+        ret_train = feat_df[RET_COL].iloc[ts : i + 1].values.astype(float)
+
+        garch_preds_baseline, _, _, _fallback_info = garch_forward_vol_forecast_robust(
+            ret_train,
+            h,
+            VOL_TARGET_WINDOW,
+            BASELINE_GARCH_SPEC,
+            fallback_specs=[],
+        )
+        preds_garch_dev_baseline.extend(garch_preds_baseline.tolist())
+
+        garch_preds_primary, cond_vol_primary, _, _fallback_info = garch_forward_vol_forecast_robust(
+            ret_train,
+            h,
+            VOL_TARGET_WINDOW,
+            PRIMARY_GARCH_SPEC,
+            fallback_specs=[BASELINE_GARCH_SPEC],
+        )
+        preds_garch_dev_primary.extend(garch_preds_primary.tolist())
+
+        n_fit = X_fit_raw_ridge.shape[0]
+        cond_vol_fit = cond_vol_primary[-n_fit:].reshape(-1, 1)
+        cond_vol_test = garch_preds_primary.reshape(-1, 1)
+
+        X_fit_raw_ridge = np.hstack([X_fit_raw_ridge, cond_vol_fit])
+        X_test_raw_ridge = np.hstack([X_test_raw_ridge, cond_vol_test])
+        X_fit_raw_broad = np.hstack([X_fit_raw_broad, cond_vol_fit])
+        X_test_raw_broad = np.hstack([X_test_raw_broad, cond_vol_test])
+
+        X_fit_full_ridge, X_test_full_ridge = winsorise(X_fit_raw_ridge, X_test_raw_ridge)
+        X_fit_full_broad, X_test_full_broad = winsorise(X_fit_raw_broad, X_test_raw_broad)
+
+        fold_data = []
+        for train_idx, val_idx in list(ts_cv.split(X_fit_full_broad)):
+            X_tr_ridge = X_fit_full_ridge[train_idx]
+            X_va_ridge = X_fit_full_ridge[val_idx]
+            X_tr_broad = X_fit_full_broad[train_idx]
+            X_va_broad = X_fit_full_broad[val_idx]
+            y_tr = y_log_w[train_idx]
+            y_va = y_log_w[val_idx]
+            fold_data.append((X_tr_ridge, X_va_ridge, X_tr_broad, X_va_broad, y_tr, y_va))
+
+        best_ridge_alpha, best_ridge_score = 10.0, np.inf
+        ridge_val_preds = []
+        for alpha in RIDGE_ALPHA_GRID:
+            rmse_folds = []
+            val_preds_for_alpha = []
+            try:
+                for X_tr_ridge, X_va_ridge, _, _, y_tr, y_va in fold_data:
+                    sc = StandardScaler()
+                    X_tr_scaled = sc.fit_transform(X_tr_ridge)
+                    X_va_scaled = sc.transform(X_va_ridge)
+                    m = Ridge(alpha=alpha).fit(X_tr_scaled, y_tr)
+                    pred_log_tr = m.predict(X_tr_scaled)
+                    smear = compute_smearing_factor(y_tr, pred_log_tr)
+                    pred_log_va = m.predict(X_va_scaled)
+                    p = level_from_log_with_smearing(pred_log_va, smear)
+                    val_preds_for_alpha.append(p)
+                    rmse_folds.append(np.sqrt(mean_squared_error(safe_exp(y_va), p)))
+                score = float(np.mean(rmse_folds) + 0.5 * np.std(rmse_folds))
+                if score < best_ridge_score:
+                    best_ridge_score = score
+                    best_ridge_alpha = alpha
+                    ridge_val_preds = val_preds_for_alpha
+            except Exception:
+                continue
+
+        best_xgb_config, best_xgb_score = xgb_search_configs[0], np.inf
+        xgb_val_preds = []
+        for cfg in xgb_search_configs:
+            rmse_folds = []
+            val_preds_for_xgb = []
+            try:
+                for _, _, X_tr_broad, X_va_broad, y_tr, y_va in fold_data:
+                    sc = StandardScaler()
+                    X_tr_scaled = sc.fit_transform(X_tr_broad)
+                    X_va_scaled = sc.transform(X_va_broad)
+                    m = XGBRegressor(**cfg).fit(X_tr_scaled, y_tr)
+                    pred_log_tr = m.predict(X_tr_scaled)
+                    smear = compute_smearing_factor(y_tr, pred_log_tr)
+                    pred_log_va = m.predict(X_va_scaled)
+                    p = level_from_log_with_smearing(pred_log_va, smear)
+                    val_preds_for_xgb.append(p)
+                    rmse_folds.append(np.sqrt(mean_squared_error(safe_exp(y_va), p)))
+                score = float(np.mean(rmse_folds) + 0.5 * np.std(rmse_folds))
+                if score < best_xgb_score:
+                    best_xgb_score = score
+                    best_xgb_config = cfg
+                    xgb_val_preds = val_preds_for_xgb
+            except Exception:
+                continue
+
+        best_w, best_blend_score = 0.5, np.inf
+        if len(ridge_val_preds) == len(fold_data) and len(xgb_val_preds) == len(fold_data):
+            for w in BLEND_WEIGHT_GRID:
+                rmse_folds = []
+                for fold_idx, (_, _, _, _, _, y_va) in enumerate(fold_data):
+                    p_r = ridge_val_preds[fold_idx]
+                    p_x = xgb_val_preds[fold_idx]
+                    p_b = w * p_x + (1 - w) * p_r
+                    rmse_folds.append(np.sqrt(mean_squared_error(safe_exp(y_va), p_b)))
+                score = float(np.mean(rmse_folds) + 0.5 * np.std(rmse_folds))
+                if score < best_blend_score:
+                    best_blend_score = score
+                    best_w = w
+
+        selected_ridge_alphas.append(float(best_ridge_alpha))
+        selected_blend_weights.append(float(best_w))
+        selected_xgb_keys.append(tuple(sorted(best_xgb_config.items())))
+
+        sc_ridge = StandardScaler()
+        X_fit_ridge_scaled = sc_ridge.fit_transform(X_fit_full_ridge)
+        X_test_ridge_scaled = sc_ridge.transform(X_test_full_ridge)
+        final_ridge = Ridge(alpha=best_ridge_alpha)
+        final_ridge.fit(X_fit_ridge_scaled, y_log_w)
+        pred_log_train_ridge = final_ridge.predict(X_fit_ridge_scaled)
+        smear_ridge = compute_smearing_factor(y_log_w, pred_log_train_ridge)
+        pred_levels_ridge = level_from_log_with_smearing(final_ridge.predict(X_test_ridge_scaled), smear_ridge)
+
+        sc_xgb = StandardScaler()
+        X_fit_xgb_scaled = sc_xgb.fit_transform(X_fit_full_broad)
+        X_test_xgb_scaled = sc_xgb.transform(X_test_full_broad)
+        final_xgb = XGBRegressor(**best_xgb_config)
+        final_xgb.fit(X_fit_xgb_scaled, y_log_w)
+        pred_log_train_xgb = final_xgb.predict(X_fit_xgb_scaled)
+        smear_xgb = compute_smearing_factor(y_log_w, pred_log_train_xgb)
+        pred_levels_xgb = level_from_log_with_smearing(final_xgb.predict(X_test_xgb_scaled), smear_xgb)
+
+        y_train_level = safe_exp(y_log_w)
+        y_class_tr = (y_train_level > fixed_event_threshold).astype(int)
+
+        if len(np.unique(y_class_tr)) < 2:
+            class_pred = np.full(h, float(np.mean(y_class_tr)))
+            class_prob_train = np.full(len(y_class_tr), float(np.mean(y_class_tr)))
+        else:
+            positive_count = max(1, int(np.sum(y_class_tr == 1)))
+            negative_count = max(1, int(np.sum(y_class_tr == 0)))
+            clf = _make_xgb_classifier(negative_count / positive_count)
+            clf.fit(X_fit_xgb_scaled, y_class_tr)
+            class_pred = clf.predict_proba(X_test_xgb_scaled)[:, 1]
+            class_prob_train = clf.predict_proba(X_fit_xgb_scaled)[:, 1]
+
+        dynamic_weights = np.clip(
+            best_w + REGIME_WEIGHT_BOOST * (class_pred - 0.5) * 2.0,
+            REGIME_WEIGHT_FLOOR,
+            REGIME_WEIGHT_CAP,
+        )
+        pred_levels = dynamic_weights * pred_levels_xgb + (1 - dynamic_weights) * pred_levels_ridge
+
+        train_levels_ridge = level_from_log_with_smearing(pred_log_train_ridge, smear_ridge)
+        train_levels_xgb = level_from_log_with_smearing(pred_log_train_xgb, smear_xgb)
+        dynamic_weights_train = np.clip(
+            best_w + REGIME_WEIGHT_BOOST * (class_prob_train - 0.5) * 2.0,
+            REGIME_WEIGHT_FLOOR,
+            REGIME_WEIGHT_CAP,
+        )
+        train_preds_blend = dynamic_weights_train * train_levels_xgb + (1 - dynamic_weights_train) * train_levels_ridge
+
+        if len(acts_dev) == 0:
+            resids = y_train_level - train_preds_blend
+        else:
+            resids = np.array(acts_dev, dtype=float) - np.array(preds_blend_dev, dtype=float)
+        if len(resids) == 0:
+            resids = np.array([0.0], dtype=float)
+
+        q_low = float(np.nanquantile(resids, 0.05))
+        q_high = float(np.nanquantile(resids, 0.95))
+
+        preds_ridge_dev.extend(pred_levels_ridge.tolist())
+        preds_xgb_dev.extend(pred_levels_xgb.tolist())
+        preds_blend_dev.extend(pred_levels.tolist())
+        preds_dynamic_weight_dev.extend(dynamic_weights.tolist())
+        preds_blend_low_dev.extend(np.maximum(pred_levels + q_low, EPS).tolist())
+        preds_blend_high_dev.extend(np.maximum(pred_levels + q_high, EPS).tolist())
+
+        preds_class_prob_dev.extend(class_pred.tolist())
+        class_actuals_dev.extend((y_test > fixed_event_threshold).astype(int).tolist())
+
+        acts_dev.extend(y_test.tolist())
+        dates_dev.extend(feat_df[DATE_COL].iloc[i:pe].tolist())
+        idx_dev.extend(list(range(i, pe)))
+
+        if (win_idx + 1) % 10 == 0 or win_idx == len(dev_windows) - 1:
+            emit(progress_callback, f"Development window {win_idx + 1}/{len(dev_windows)}")
+
+    final_ridge_alpha = float(np.median(selected_ridge_alphas)) if selected_ridge_alphas else 10.0
+    final_blend_weight = float(np.clip(np.mean(selected_blend_weights), 0.0, 1.0)) if selected_blend_weights else 0.5
+    final_xgb_config = dict(Counter(selected_xgb_keys).most_common(1)[0][0]) if selected_xgb_keys else xgb_search_configs[0]
+
+    idx_dev_arr = np.asarray(idx_dev, dtype=int)
+    acts_dev_arr = np.asarray(acts_dev, dtype=float)
+    naive_dev_arr = feat_df[TARGET_COL].shift(VOL_TARGET_WINDOW).iloc[idx_dev_arr].values.astype(float)
+    garch_dev_base_arr = np.asarray(preds_garch_dev_baseline, dtype=float)
+    garch_dev_primary_arr = np.asarray(preds_garch_dev_primary, dtype=float)
+
+    valid_garch_gate = np.isfinite(acts_dev_arr) & np.isfinite(naive_dev_arr)
+    acts_gate = acts_dev_arr[valid_garch_gate]
+    naive_gate = naive_dev_arr[valid_garch_gate]
+    base_gate = garch_dev_base_arr[valid_garch_gate]
+    primary_gate = garch_dev_primary_arr[valid_garch_gate]
+
+    if len(acts_gate) == 0:
+        selected_garch_spec = PRIMARY_GARCH_SPEC
+        benchmark_label = "EGARCH-t (returns variance, comparable vol)"
+        preds_garch_dev = preds_garch_dev_primary
+        base_m = {"RMSE": np.nan, "QLIKE": np.nan, "R2_vs_naive": np.nan}
+        primary_m = {"RMSE": np.nan, "QLIKE": np.nan, "R2_vs_naive": np.nan}
+    else:
+        base_m = compute_global_metrics(acts_gate, base_gate, naive_gate, BASELINE_GARCH_SPEC["name"])
+        primary_m = compute_global_metrics(acts_gate, primary_gate, naive_gate, PRIMARY_GARCH_SPEC["name"])
+
+        primary_not_worse = (
+            float(primary_m["RMSE"]) <= float(base_m["RMSE"]) + NO_WORSE_TOL
+            and float(primary_m["QLIKE"]) <= float(base_m["QLIKE"]) + NO_WORSE_TOL
+            and float(primary_m["R2_vs_naive"]) + NO_WORSE_TOL >= float(base_m["R2_vs_naive"])
+        )
+
+        if primary_not_worse:
+            selected_garch_spec = PRIMARY_GARCH_SPEC
+            benchmark_label = "EGARCH-t (returns variance, comparable vol)"
+            preds_garch_dev = preds_garch_dev_primary
+        else:
+            selected_garch_spec = BASELINE_GARCH_SPEC
+            benchmark_label = "GARCH-normal (returns variance, comparable vol)"
+            preds_garch_dev = preds_garch_dev_baseline
+
+    emit(progress_callback, f"Selected GARCH benchmark: {selected_garch_spec['name']}")
+
+    return {
+        "preds_ridge": preds_ridge_dev,
+        "preds_xgb": preds_xgb_dev,
+        "preds_blend": preds_blend_dev,
+        "preds_garch": preds_garch_dev,
+        "acts": acts_dev,
+        "dates": dates_dev,
+        "idx": idx_dev,
+        "preds_blend_low": preds_blend_low_dev,
+        "preds_blend_high": preds_blend_high_dev,
+        "preds_class_prob": preds_class_prob_dev,
+        "class_actuals": class_actuals_dev,
+        "preds_dynamic_weight": preds_dynamic_weight_dev,
+        "final_ridge_alpha": final_ridge_alpha,
+        "final_blend_weight": final_blend_weight,
+        "final_xgb_config": final_xgb_config,
+        "selected_garch_spec": selected_garch_spec,
+        "benchmark_label": benchmark_label,
+        "garch_gate": {"baseline": base_m, "primary": primary_m},
+    }
+
+
+def run_holdout_walk_forward(
+    feat_df: pd.DataFrame,
+    holdout_start_idx: int,
+    fixed_event_threshold: float,
+    stable_features_ridge: List[str],
+    stable_features_broad: List[str],
+    development_result: Dict[str, Any],
+    progress_callback: ProgressCallback = None,
+) -> Dict[str, Any]:
+    preds_ridge_h: List[float] = []
+    preds_xgb_h: List[float] = []
+    preds_blend_h: List[float] = []
+    preds_garch_h: List[float] = []
+    acts_h: List[float] = []
+    dates_h: List[pd.Timestamp] = []
+    idx_h: List[int] = []
+    preds_blend_low_h: List[float] = []
+    preds_blend_high_h: List[float] = []
+    preds_class_prob_h: List[float] = []
+    class_actuals_h: List[int] = []
+    preds_dynamic_weight_h: List[float] = []
+
+    holdout_windows = list(range(holdout_start_idx, len(feat_df), STEP_SIZE))
+    emit(progress_callback, f"Holdout windows: {len(holdout_windows)}")
+
+    for win_idx, i in enumerate(holdout_windows):
+        ts = max(0, i - ROLLING_WINDOW)
+        pe = min(i + STEP_SIZE, len(feat_df))
+        h = pe - i
+        train_end = i - LABEL_GAP
+
+        if h <= 0 or train_end <= ts + 100:
+            continue
+
+        y_log_w = feat_df["log_target"].iloc[ts:train_end].values.astype(float)
+        y_test = feat_df[TARGET_COL].iloc[i:pe].values.astype(float)
+
+        X_fit_raw_ridge = np.nan_to_num(
+            feat_df[stable_features_ridge].iloc[ts:train_end].values.astype(float),
+            nan=0,
+            posinf=0,
+            neginf=0,
+        )
+        X_test_raw_ridge = np.nan_to_num(
+            feat_df[stable_features_ridge].iloc[i:pe].values.astype(float),
+            nan=0,
+            posinf=0,
+            neginf=0,
+        )
+
+        X_fit_raw_broad = np.nan_to_num(
+            feat_df[stable_features_broad].iloc[ts:train_end].values.astype(float),
+            nan=0,
+            posinf=0,
+            neginf=0,
+        )
+        X_test_raw_broad = np.nan_to_num(
+            feat_df[stable_features_broad].iloc[i:pe].values.astype(float),
+            nan=0,
+            posinf=0,
+            neginf=0,
+        )
+
+        ret_train = feat_df[RET_COL].iloc[ts : i + 1].values.astype(float)
+
+        garch_preds, cond_vol_h_win, _, _fallback_info = garch_forward_vol_forecast_robust(
+            ret_train,
+            h,
+            VOL_TARGET_WINDOW,
+            development_result["selected_garch_spec"],
+            fallback_specs=[BASELINE_GARCH_SPEC],
+        )
+        preds_garch_h.extend(garch_preds.tolist())
+
+        n_fit = X_fit_raw_ridge.shape[0]
+        cond_vol_fit = cond_vol_h_win[-n_fit:].reshape(-1, 1)
+        cond_vol_test = garch_preds.reshape(-1, 1)
+
+        X_fit_raw_ridge = np.hstack([X_fit_raw_ridge, cond_vol_fit])
+        X_test_raw_ridge = np.hstack([X_test_raw_ridge, cond_vol_test])
+        X_fit_raw_broad = np.hstack([X_fit_raw_broad, cond_vol_fit])
+        X_test_raw_broad = np.hstack([X_test_raw_broad, cond_vol_test])
+
+        X_fit_full_ridge, X_test_full_ridge = winsorise(X_fit_raw_ridge, X_test_raw_ridge)
+        X_fit_full_broad, X_test_full_broad = winsorise(X_fit_raw_broad, X_test_raw_broad)
+
+        sc_ridge = StandardScaler()
+        X_fit_ridge_scaled = sc_ridge.fit_transform(X_fit_full_ridge)
+        X_test_ridge_scaled = sc_ridge.transform(X_test_full_ridge)
+        final_ridge = Ridge(alpha=development_result["final_ridge_alpha"])
+        final_ridge.fit(X_fit_ridge_scaled, y_log_w)
+        pred_log_train_ridge = final_ridge.predict(X_fit_ridge_scaled)
+        smear_ridge = compute_smearing_factor(y_log_w, pred_log_train_ridge)
+        pred_levels_ridge = level_from_log_with_smearing(final_ridge.predict(X_test_ridge_scaled), smear_ridge)
+
+        sc_xgb = StandardScaler()
+        X_fit_xgb_scaled = sc_xgb.fit_transform(X_fit_full_broad)
+        X_test_xgb_scaled = sc_xgb.transform(X_test_full_broad)
+        final_xgb = XGBRegressor(**development_result["final_xgb_config"])
+        final_xgb.fit(X_fit_xgb_scaled, y_log_w)
+        pred_log_train_xgb = final_xgb.predict(X_fit_xgb_scaled)
+        smear_xgb = compute_smearing_factor(y_log_w, pred_log_train_xgb)
+        pred_levels_xgb = level_from_log_with_smearing(final_xgb.predict(X_test_xgb_scaled), smear_xgb)
+
+        y_train_level = safe_exp(y_log_w)
+        y_class_tr = (y_train_level > fixed_event_threshold).astype(int)
+
+        if len(np.unique(y_class_tr)) < 2:
+            class_pred = np.full(h, float(np.mean(y_class_tr)))
+            class_prob_train = np.full(len(y_class_tr), float(np.mean(y_class_tr)))
+        else:
+            positive_count = max(1, int(np.sum(y_class_tr == 1)))
+            negative_count = max(1, int(np.sum(y_class_tr == 0)))
+            clf = _make_xgb_classifier(negative_count / positive_count)
+            clf.fit(X_fit_xgb_scaled, y_class_tr)
+            class_pred = clf.predict_proba(X_test_xgb_scaled)[:, 1]
+            class_prob_train = clf.predict_proba(X_fit_xgb_scaled)[:, 1]
+
+        dynamic_weights = np.clip(
+            development_result["final_blend_weight"] + REGIME_WEIGHT_BOOST * (class_pred - 0.5) * 2.0,
+            REGIME_WEIGHT_FLOOR,
+            REGIME_WEIGHT_CAP,
+        )
+        pred_levels = dynamic_weights * pred_levels_xgb + (1 - dynamic_weights) * pred_levels_ridge
+
+        train_levels_ridge = level_from_log_with_smearing(pred_log_train_ridge, smear_ridge)
+        train_levels_xgb = level_from_log_with_smearing(pred_log_train_xgb, smear_xgb)
+        dynamic_weights_train = np.clip(
+            development_result["final_blend_weight"] + REGIME_WEIGHT_BOOST * (class_prob_train - 0.5) * 2.0,
+            REGIME_WEIGHT_FLOOR,
+            REGIME_WEIGHT_CAP,
+        )
+        train_preds_blend = dynamic_weights_train * train_levels_xgb + (1 - dynamic_weights_train) * train_levels_ridge
+
+        if len(acts_h) == 0:
+            if len(development_result["acts"]) > 0:
+                resids = np.array(development_result["acts"], dtype=float) - np.array(development_result["preds_blend"], dtype=float)
+            else:
+                resids = y_train_level - train_preds_blend
+        else:
+            resids = np.array(acts_h, dtype=float) - np.array(preds_blend_h, dtype=float)
+
+        if len(resids) == 0:
+            resids = np.array([0.0], dtype=float)
+
+        q_low = float(np.nanquantile(resids, 0.05))
+        q_high = float(np.nanquantile(resids, 0.95))
+
+        preds_ridge_h.extend(pred_levels_ridge.tolist())
+        preds_xgb_h.extend(pred_levels_xgb.tolist())
+        preds_blend_h.extend(pred_levels.tolist())
+        preds_dynamic_weight_h.extend(dynamic_weights.tolist())
+        preds_blend_low_h.extend(np.maximum(pred_levels + q_low, EPS).tolist())
+        preds_blend_high_h.extend(np.maximum(pred_levels + q_high, EPS).tolist())
+
+        preds_class_prob_h.extend(class_pred.tolist())
+        class_actuals_h.extend((y_test > fixed_event_threshold).astype(int).tolist())
+
+        acts_h.extend(y_test.tolist())
+        dates_h.extend(feat_df[DATE_COL].iloc[i:pe].tolist())
+        idx_h.extend(list(range(i, pe)))
+
+        if (win_idx + 1) % 5 == 0 or win_idx == len(holdout_windows) - 1:
+            emit(progress_callback, f"Holdout window {win_idx + 1}/{len(holdout_windows)}")
+
+    return {
+        "preds_ridge": preds_ridge_h,
+        "preds_xgb": preds_xgb_h,
+        "preds_blend": preds_blend_h,
+        "preds_garch": preds_garch_h,
+        "acts": acts_h,
+        "dates": dates_h,
+        "idx": idx_h,
+        "preds_blend_low": preds_blend_low_h,
+        "preds_blend_high": preds_blend_high_h,
+        "preds_class_prob": preds_class_prob_h,
+        "class_actuals": class_actuals_h,
+        "preds_dynamic_weight": preds_dynamic_weight_h,
+    }
+
+
+def evaluate_block(
+    feat_df: pd.DataFrame,
+    idxs: List[int],
+    y_true: List[float],
+    p_garch: List[float],
+    p_ridge: List[float],
+    p_xgb: List[float],
+    p_blend: List[float],
+    class_actuals: List[int],
+    class_probs: List[float],
+    benchmark_label: str,
+) -> Tuple[pd.DataFrame, np.ndarray, float, float, np.ndarray]:
+    idxs_arr = np.asarray(idxs, dtype=int)
+    y_true_arr = np.asarray(y_true, dtype=float)
+    p_garch_arr = np.asarray(p_garch, dtype=float)
+    p_ridge_arr = np.asarray(p_ridge, dtype=float)
+    p_xgb_arr = np.asarray(p_xgb, dtype=float)
+    p_blend_arr = np.asarray(p_blend, dtype=float)
+
+    naive_series = feat_df[TARGET_COL].shift(VOL_TARGET_WINDOW)
+    p_naive = naive_series.iloc[idxs_arr].values.astype(float)
+
+    valid = np.isfinite(y_true_arr) & np.isfinite(p_naive)
+    y_true_valid = y_true_arr[valid]
+    p_naive_valid = p_naive[valid]
+    p_garch_valid = p_garch_arr[valid]
+    p_ridge_valid = p_ridge_arr[valid]
+    p_xgb_valid = p_xgb_arr[valid]
+    p_blend_valid = p_blend_arr[valid]
+
+    summary_rows = [
+        compute_global_metrics(y_true_valid, p_naive_valid, p_naive_valid, "Naive (lag-observed)"),
+        compute_global_metrics(y_true_valid, p_garch_valid, p_naive_valid, benchmark_label),
+        compute_global_metrics(y_true_valid, p_ridge_valid, p_naive_valid, "Ridge Hybrid"),
+        compute_global_metrics(y_true_valid, p_xgb_valid, p_naive_valid, "XGBoost Hybrid"),
+        compute_global_metrics(y_true_valid, p_blend_valid, p_naive_valid, "Regime-Aware Blended Hybrid"),
+    ]
+    summary_df = pd.DataFrame(summary_rows)
+
+    class_actuals_arr = np.asarray(class_actuals, dtype=int)[valid]
+    class_probs_arr = np.asarray(class_probs, dtype=float)[valid]
+
+    if len(class_actuals_arr) > 0 and len(np.unique(class_actuals_arr)) > 1:
+        roc_auc = float(roc_auc_score(class_actuals_arr, class_probs_arr))
+        f1 = float(f1_score(class_actuals_arr, (class_probs_arr > 0.5).astype(int)))
+    else:
+        roc_auc = np.nan
+        f1 = np.nan
+
+    return summary_df, p_naive_valid, roc_auc, f1, valid
+
+
+def build_output_frame(result: Dict[str, Any], valid: np.ndarray, p_naive: np.ndarray) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            DATE_COL: np.array(result["dates"], dtype="datetime64[ns]")[valid],
+            "actual": np.asarray(result["acts"], dtype=float)[valid],
+            "naive_lag_observed": p_naive,
+            "pred_garch_var": np.asarray(result["preds_garch"], dtype=float)[valid],
+            "pred_ridge": np.asarray(result["preds_ridge"], dtype=float)[valid],
+            "pred_xgb": np.asarray(result["preds_xgb"], dtype=float)[valid],
+            "pred_blend": np.asarray(result["preds_blend"], dtype=float)[valid],
+            "dynamic_weight_xgb": np.asarray(result["preds_dynamic_weight"], dtype=float)[valid],
+            "pred_blend_p05": np.asarray(result["preds_blend_low"], dtype=float)[valid],
+            "pred_blend_p95": np.asarray(result["preds_blend_high"], dtype=float)[valid],
+            "actual_high_vol_fixed": np.asarray(result["class_actuals"], dtype=int)[valid],
+            "prob_high_vol": np.asarray(result["preds_class_prob"], dtype=float)[valid],
+        }
+    )
+
+
+def build_live_forecast(
+    feat_df: pd.DataFrame,
+    stable_features_ridge: List[str],
+    stable_features_broad: List[str],
+    fixed_event_threshold: float,
+    development_result: Dict[str, Any],
+    holdout_result: Dict[str, Any],
+) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
+    train_end_final = len(feat_df) - LABEL_GAP
+    if train_end_final <= 100:
+        raise ValueError("Not enough engineered rows to train the final forecast.")
+
+    ts_final = max(0, train_end_final - ROLLING_WINDOW)
+    y_log_full = feat_df["log_target"].iloc[ts_final:train_end_final].values.astype(float)
+
+    X_fit_ridge_raw = np.nan_to_num(
+        feat_df[stable_features_ridge].iloc[ts_final:train_end_final].values.astype(float),
+        nan=0,
+        posinf=0,
+        neginf=0,
+    )
+    X_fit_broad_raw = np.nan_to_num(
+        feat_df[stable_features_broad].iloc[ts_final:train_end_final].values.astype(float),
+        nan=0,
+        posinf=0,
+        neginf=0,
+    )
+
+    ret_full = feat_df[RET_COL].iloc[ts_final : len(feat_df)].values.astype(float)
+    garch_fc_final, _, garch_spec_used, live_fallback_info = garch_forward_vol_forecast_robust(
+        ret_full,
+        horizon=VOL_TARGET_WINDOW,
+        vol_window=VOL_TARGET_WINDOW,
+        primary_spec=development_result["selected_garch_spec"],
+        fallback_specs=[BASELINE_GARCH_SPEC],
+    )
+
+    X_test_ridge_raw = np.nan_to_num(
+        feat_df[stable_features_ridge].iloc[[-1]].values.astype(float),
+        nan=0,
+        posinf=0,
+        neginf=0,
+    )
+    X_test_broad_raw = np.nan_to_num(
+        feat_df[stable_features_broad].iloc[[-1]].values.astype(float),
+        nan=0,
+        posinf=0,
+        neginf=0,
+    )
+
+    X_fit_ridge_w, X_test_ridge_w = winsorise(X_fit_ridge_raw, X_test_ridge_raw)
+    X_fit_broad_w, X_test_broad_w = winsorise(X_fit_broad_raw, X_test_broad_raw)
+
+    sc_ridge_final = StandardScaler()
+    X_fit_ridge_sc = sc_ridge_final.fit_transform(X_fit_ridge_w)
+    X_test_ridge_sc = sc_ridge_final.transform(X_test_ridge_w)
+
+    final_ridge_model = Ridge(alpha=development_result["final_ridge_alpha"])
+    final_ridge_model.fit(X_fit_ridge_sc, y_log_full)
+
+    pred_log_train_ridge_f = final_ridge_model.predict(X_fit_ridge_sc)
+    smear_ridge_f = compute_smearing_factor(y_log_full, pred_log_train_ridge_f)
+    pred_ridge_final = level_from_log_with_smearing(final_ridge_model.predict(X_test_ridge_sc), smear_ridge_f)[0]
+
+    sc_xgb_final = StandardScaler()
+    X_fit_xgb_sc = sc_xgb_final.fit_transform(X_fit_broad_w)
+    X_test_xgb_sc = sc_xgb_final.transform(X_test_broad_w)
+
+    final_xgb_model = XGBRegressor(**development_result["final_xgb_config"])
+    final_xgb_model.fit(X_fit_xgb_sc, y_log_full)
+
+    pred_log_train_xgb_f = final_xgb_model.predict(X_fit_xgb_sc)
+    smear_xgb_f = compute_smearing_factor(y_log_full, pred_log_train_xgb_f)
+    pred_xgb_final = level_from_log_with_smearing(final_xgb_model.predict(X_test_xgb_sc), smear_xgb_f)[0]
+
+    y_train_level_f = safe_exp(y_log_full)
+    y_class_tr_f = (y_train_level_f > fixed_event_threshold).astype(int)
+
+    if len(np.unique(y_class_tr_f)) < 2:
+        regime_prob = float(np.mean(y_class_tr_f))
+    else:
+        pos_count = max(1, int(np.sum(y_class_tr_f == 1)))
+        neg_count = max(1, int(np.sum(y_class_tr_f == 0)))
+        clf_final = _make_xgb_classifier(neg_count / pos_count)
+        clf_final.fit(X_fit_xgb_sc, y_class_tr_f)
+        regime_prob = float(clf_final.predict_proba(X_test_xgb_sc)[0, 1])
+
+    is_high_vol_regime = regime_prob >= 0.5
+    final_dynamic_weight = float(
+        np.clip(
+            development_result["final_blend_weight"] + REGIME_WEIGHT_BOOST * (regime_prob - 0.5) * 2.0,
+            REGIME_WEIGHT_FLOOR,
+            REGIME_WEIGHT_CAP,
+        )
+    )
+
+    final_forecast = final_dynamic_weight * pred_xgb_final + (1 - final_dynamic_weight) * pred_ridge_final
+    ridge_feature_names = stable_features_ridge + ["garch_cond_vol"]
+    xgb_feature_names = stable_features_broad + ["garch_cond_vol"]
+    live_model_details = {
+        "feature_importance_top_5": compute_top_feature_importance(
+            xgb_feature_names=xgb_feature_names,
+            xgb_importances=getattr(final_xgb_model, "feature_importances_", []),
+            ridge_feature_names=ridge_feature_names,
+            ridge_coefficients=getattr(final_ridge_model, "coef_", []),
+        ),
+        "ridge_feature_count": len(ridge_feature_names),
+        "xgb_feature_count": len(xgb_feature_names),
+    }
+
+    all_resids = np.array(holdout_result["acts"], dtype=float) - np.array(holdout_result["preds_blend"], dtype=float)
+    if len(all_resids) == 0:
+        all_resids = np.array([0.0], dtype=float)
+    q_low_f = float(np.nanquantile(all_resids, 0.05))
+    q_high_f = float(np.nanquantile(all_resids, 0.95))
+
+    forecast_p05 = max(final_forecast + q_low_f, EPS)
+    forecast_p95 = max(final_forecast + q_high_f, EPS)
+
+    last_date = feat_df[DATE_COL].iloc[-1]
+    forecast_label = f"next {VOL_TARGET_WINDOW}-day window after {last_date.date()}"
+
+    # Extract event regime context from the last row for diagnostic reporting
+    last_row = feat_df.iloc[-1]
+    event_context = {}
+    if 'event_regime' in feat_df.columns:
+        event_context['event_regime'] = last_row.get('event_regime', 'unclassified')
+    if 'event_regime_description' in feat_df.columns:
+        event_context['event_regime_description'] = last_row.get('event_regime_description', '')
+    if 'event_regime_code' in feat_df.columns:
+        event_context['event_regime_code'] = int(last_row.get('event_regime_code', -1))
+    if 'covid_dummy' in feat_df.columns:
+        event_context['covid_dummy'] = int(last_row.get('covid_dummy', 0))
+    if 'ukraine_war_dummy' in feat_df.columns:
+        event_context['ukraine_war_dummy'] = int(last_row.get('ukraine_war_dummy', 0))
+    if 'us_tariff_dummy' in feat_df.columns:
+        event_context['us_tariff_dummy'] = int(last_row.get('us_tariff_dummy', 0))
+    if 'iran_geopolitical_dummy' in feat_df.columns:
+        event_context['iran_geopolitical_dummy'] = int(last_row.get('iran_geopolitical_dummy', 0))
+    if 'any_crisis_dummy' in feat_df.columns:
+        event_context['any_crisis_dummy'] = int(last_row.get('any_crisis_dummy', 0))
+
+    forecast_payload = {
+        "forecast_date": last_date,
+        "forecast_label": forecast_label,
+        "horizon_days": VOL_TARGET_WINDOW,
+        "pred_ridge": round(float(pred_ridge_final), 8),
+        "pred_xgb": round(float(pred_xgb_final), 8),
+        "blend_weight_xgb": round(float(final_dynamic_weight), 4),
+        "regime_prob_high_vol": round(float(regime_prob), 4),
+        "regime_flag": "HIGH_VOL" if is_high_vol_regime else "NORMAL",
+        "garch_anchor": round(float(garch_fc_final[0]), 8),
+        "selected_garch_benchmark": development_result["selected_garch_spec"]["name"],
+        "live_garch_anchor_used": garch_spec_used,
+        "live_garch_fallback_triggered": bool(live_fallback_info.get("fallback_triggered", False)),
+        "live_garch_fallback_reason": live_fallback_info.get("fallback_reason"),
+        "live_garch_attempted_specs": live_fallback_info.get("attempted_specs", []),
+        "garch_spec_used": garch_spec_used,
+        "final_forecast_blend": round(float(final_forecast), 8),
+        "forecast_p05": round(float(forecast_p05), 8),
+        "forecast_p95": round(float(forecast_p95), 8),
+        "fixed_event_threshold": round(float(fixed_event_threshold), 8),
+        **event_context,  # Include economic event regime context
+    }
+    forecast_df = pd.DataFrame([forecast_payload])
+    return forecast_df, forecast_payload, live_model_details
+
+
+def run_pipeline(
+    input_path: Path | str = RAW_FILE_PATH,
+    output_dir: Optional[Path | str] = None,
+    save_outputs: bool = True,
+    progress_callback: ProgressCallback = None,
+) -> ForecastRunResult:
+    input_path = Path(input_path)
+    artifact_dir = Path(output_dir) if output_dir is not None else Path(".")
+    artifact_paths: Dict[str, Path] = {
+        key: artifact_dir / filename for key, filename in ARTIFACT_FILENAMES.items()
+    }
+
+    if save_outputs:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    input_validation_summary = validate_input_file(input_path)
+
+    emit(progress_callback, "Preparing data")
+    df = prepare_data(input_path)
+
+    emit(progress_callback, "Engineering features")
+    feat_df, feature_cols = build_feature_frame(df)
+
+    event_analysis_df = build_event_analysis_frame(input_path)
+
+    if save_outputs:
+        feat_df.to_excel(artifact_paths["model_ready_dataset"], index=False)
+
+    emit(progress_callback, "Designing split and stable features")
+    split_design = design_split_and_features(feat_df, feature_cols, progress_callback)
+
+    emit(progress_callback, "Running development walk-forward")
+    development_result = run_development_walk_forward(
+        feat_df,
+        split_design["holdout_start_idx"],
+        split_design["fixed_event_threshold"],
+        split_design["stable_features_ridge"],
+        split_design["stable_features_broad"],
+        progress_callback,
+    )
+
+    emit(progress_callback, "Running untouched holdout walk-forward")
+    holdout_result = run_holdout_walk_forward(
+        feat_df,
+        split_design["holdout_start_idx"],
+        split_design["fixed_event_threshold"],
+        split_design["stable_features_ridge"],
+        split_design["stable_features_broad"],
+        development_result,
+        progress_callback,
+    )
+
+    emit(progress_callback, "Evaluating results")
+    summary_dev_df, p_naive_dev, roc_dev, f1_dev, valid_dev = evaluate_block(
+        feat_df,
+        development_result["idx"],
+        development_result["acts"],
+        development_result["preds_garch"],
+        development_result["preds_ridge"],
+        development_result["preds_xgb"],
+        development_result["preds_blend"],
+        development_result["class_actuals"],
+        development_result["preds_class_prob"],
+        development_result["benchmark_label"],
+    )
+    summary_holdout_df, p_naive_h, roc_h, f1_h, valid_h = evaluate_block(
+        feat_df,
+        holdout_result["idx"],
+        holdout_result["acts"],
+        holdout_result["preds_garch"],
+        holdout_result["preds_ridge"],
+        holdout_result["preds_xgb"],
+        holdout_result["preds_blend"],
+        holdout_result["class_actuals"],
+        holdout_result["preds_class_prob"],
+        development_result["benchmark_label"],
+    )
+
+    dev_df_out = build_output_frame(development_result, valid_dev, p_naive_dev)
+    holdout_df_out = build_output_frame(holdout_result, valid_h, p_naive_h)
+
+    # Enrich output frames with event regime information for diagnostic analysis
+    dev_df_out = attach_event_regime_to_output(dev_df_out, feat_df)
+    holdout_df_out = attach_event_regime_to_output(holdout_df_out, feat_df)
+
+    # Compute event-regime descriptive statistics and forecast diagnostics
+    # These are calendar-known regime context variables used for analysis only, not for separate model training.
+    # Event-specific metrics complement the full-sample benchmark and help identify systematic differences
+    # in USD/TND volatility and forecast performance across major global shocks.
+    event_descriptive_stats_df = compute_event_regime_descriptive_stats(
+        event_analysis_df,
+        high_volatility_cutoff=split_design["fixed_event_threshold"],
+    )
+    if not event_descriptive_stats_df.empty:
+        event_descriptive_stats_df = event_descriptive_stats_df.sort_values("event_regime_code").reset_index(drop=True)
+
+    event_metrics_dev_df = compute_event_regime_forecast_metrics(dev_df_out)
+    if not event_metrics_dev_df.empty:
+        event_metrics_dev_df = event_metrics_dev_df.sort_values(["event_regime_code", "model"]).reset_index(drop=True)
+
+    event_metrics_holdout_df = compute_event_regime_forecast_metrics(holdout_df_out)
+    if not event_metrics_holdout_df.empty:
+        event_metrics_holdout_df = event_metrics_holdout_df.sort_values(["event_regime_code", "model"]).reset_index(drop=True)
+
+    if save_outputs:
+        emit(progress_callback, "Building high-volatility classifier calibration diagnostics")
+        build_high_volatility_calibration_diagnostics(
+            development_results=dev_df_out,
+            holdout_results=holdout_df_out,
+            output_path=artifact_paths["high_vol_classifier_calibration_diagnostics"],
+            high_volatility_cutoff=split_design["fixed_event_threshold"],
+        )
+
+    emit(progress_callback, "Building live final forecast")
+    forecast_df, forecast_payload, live_model_details = build_live_forecast(
+        feat_df,
+        split_design["stable_features_ridge"],
+        split_design["stable_features_broad"],
+        split_design["fixed_event_threshold"],
+        development_result,
+        holdout_result,
+    )
+
+    emit(progress_callback, "Building dashboard analytics")
+    dashboard_payload = build_dashboard_payload(
+        feat_df,
+        development_result,
+        holdout_result,
+        dev_df_out,
+        holdout_df_out,
+        summary_dev_df,
+        summary_holdout_df,
+        forecast_payload,
+        live_model_details,
+    )
+
+    # Add event-regime analysis to dashboard payload.
+    # Event dummies and event interactions are calendar-known model inputs;
+    # event labels are also diagnostic overlays.
+    dashboard_payload["economic_event_analysis"] = {
+        "descriptive_stats": dataframe_to_json_safe_records(event_descriptive_stats_df),
+        "development_event_metrics": dataframe_to_json_safe_records(event_metrics_dev_df),
+        "holdout_event_metrics": dataframe_to_json_safe_records(event_metrics_holdout_df),
+        "commentary": (
+            "Economic event regimes serve two roles. Event dummies and event interaction terms are used as calendar-known model inputs "
+            "to allow the model to condition on documented macro-financial regimes. The same event labels are also used as post-estimation "
+            "diagnostic overlays to compare forecast performance across normal and stress periods. Descriptive event-volatility statistics "
+            "are computed from a stable event-analysis dataset based on USD/TND returns and the 3-day volatility target, not from the final "
+            "ML feature matrix. This prevents changes in optional engineered model features from changing historical event-volatility comparisons."
+        ),
+    }
+
+    if save_outputs:
+        dev_df_out.to_excel(artifact_paths["development_results"], index=False)
+        holdout_df_out.to_excel(artifact_paths["holdout_results"], index=False)
+        summary_dev_df.to_excel(artifact_paths["development_summary"], index=False)
+        summary_holdout_df.to_excel(artifact_paths["holdout_summary"], index=False)
+        forecast_df.to_excel(artifact_paths["final_forecast"], index=False)
+        
+        # Save event analysis tables with robust validation and final sorting
+        if not event_descriptive_stats_df.empty and "event_regime_code" in event_descriptive_stats_df.columns:
+            event_descriptive_stats_df = (
+                event_descriptive_stats_df
+                .sort_values("event_regime_code")
+                .reset_index(drop=True)
+            )
+            event_descriptive_stats_df.to_excel(artifact_paths["event_descriptive_stats"], index=False)
+        
+        if not event_metrics_dev_df.empty and {"event_regime_code", "model"}.issubset(event_metrics_dev_df.columns):
+            event_metrics_dev_df = (
+                event_metrics_dev_df
+                .sort_values(["event_regime_code", "model"])
+                .reset_index(drop=True)
+            )
+            event_metrics_dev_df.to_excel(artifact_paths["event_metrics_development"], index=False)
+        
+        if not event_metrics_holdout_df.empty and {"event_regime_code", "model"}.issubset(event_metrics_holdout_df.columns):
+            event_metrics_holdout_df = (
+                event_metrics_holdout_df
+                .sort_values(["event_regime_code", "model"])
+                .reset_index(drop=True)
+            )
+            event_metrics_holdout_df.to_excel(artifact_paths["event_metrics_holdout"], index=False)
+
+    # Validate event-aware methodology integration
+    emit(progress_callback, "Validating event-aware methodology integration")
+    validation_result = validate_event_methodology_integration(
+        feat_df,
+        feature_cols,
+        split_design["stable_features_ridge"],
+        split_design["stable_features_broad"],
+    )
+    validation_status = validation_result["status"]
+    if validation_status == "PASS":
+        emit(progress_callback, "Event methodology validation: PASS")
+    else:
+        emit(progress_callback, "Event methodology validation: REVIEW")
+
+    metadata = {
+        "input_path": str(input_path),
+        "run_timestamp": pd.Timestamp.utcnow().isoformat(),
+        "input_file_sha256": compute_file_sha256(input_path),
+        "row_count_prepared": int(len(df)),
+        "row_count_engineered": int(len(feat_df)),
+        "feature_count": int(len(feature_cols)),
+        "feature_cols": feature_cols,
+        "stable_features_ridge": split_design["stable_features_ridge"],
+        "stable_features_broad": split_design["stable_features_broad"],
+        "fixed_high_vol_threshold": float(split_design["fixed_event_threshold"]),
+        "optional_input_columns_available": input_validation_summary.get(
+            "optional_input_columns_available",
+            [],
+        ),
+        "optional_input_columns_missing": input_validation_summary.get(
+            "optional_input_columns_missing",
+            [],
+        ),
+        "optional_inputs_available": input_validation_summary.get(
+            "optional_input_columns_available",
+            [],
+        ),
+        "optional_inputs_missing": input_validation_summary.get(
+            "optional_input_columns_missing",
+            [],
+        ),
+        "new_market_features_available": [
+            c for c in NEW_PREPARED_FEATURES if c in feat_df.columns
+        ],
+        "new_market_features_in_feature_cols": [
+            c for c in NEW_PREPARED_FEATURES if c in feat_df.columns and c in feature_cols
+        ],
+        "rolling_window_days": int(ROLLING_WINDOW),
+        "forecast_horizon_days": int(VOL_TARGET_WINDOW),
+        "step_size_days": int(STEP_SIZE),
+        "holdout_start": split_design["holdout_start_date"],
+        "holdout_start_idx": int(split_design["holdout_start_idx"]),
+        "development_classifier_roc_auc": roc_dev,
+        "development_classifier_f1": f1_dev,
+        "holdout_classifier_roc_auc": roc_h,
+        "holdout_classifier_f1": f1_h,
+        "final_xgb_config": development_result["final_xgb_config"],
+        "final_ridge_alpha": development_result["final_ridge_alpha"],
+        "final_blend_weight": development_result["final_blend_weight"],
+        "selected_garch_benchmark": development_result["selected_garch_spec"]["name"],
+        "live_garch_anchor_used": forecast_payload.get("live_garch_anchor_used"),
+        "live_garch_fallback_triggered": forecast_payload.get("live_garch_fallback_triggered"),
+        "live_garch_fallback_reason": forecast_payload.get("live_garch_fallback_reason"),
+        "live_garch_attempted_specs": forecast_payload.get("live_garch_attempted_specs", []),
+        "selected_garch_spec": development_result["selected_garch_spec"]["name"],
+        "garch_gate": development_result["garch_gate"],
+        "live_model_details": live_model_details,
+        "package_versions": get_package_versions(),
+        "event_regimes_used": EVENT_REGIME_DEFINITIONS,
+        "event_dummy_columns": EVENT_DUMMY_COLUMNS,
+        "event_interaction_columns": EVENT_INTERACTION_COLUMNS,
+        "event_features_available": split_design.get("event_features_available", []),
+        "event_features_in_ridge": split_design.get("event_features_in_ridge", []),
+        "event_features_in_broad": split_design.get("event_features_in_broad", []),
+        "event_analysis_row_count": int(len(event_analysis_df)),
+        "event_analysis_start_date": event_analysis_df[DATE_COL].min() if not event_analysis_df.empty else None,
+        "event_analysis_end_date": event_analysis_df[DATE_COL].max() if not event_analysis_df.empty else None,
+        "event_analysis_regime_counts": (
+            event_analysis_df["event_regime"].value_counts().to_dict()
+            if "event_regime" in event_analysis_df.columns
+            else {}
+        ),
+        "event_descriptive_stats_source": "event_analysis_df",
+        "event_forecast_metrics_source": "walk_forward_outputs",
+        "event_descriptive_stats_records": dataframe_to_json_safe_records(event_descriptive_stats_df),
+        "event_metrics_dev_records": dataframe_to_json_safe_records(event_metrics_dev_df),
+        "event_metrics_holdout_records": dataframe_to_json_safe_records(event_metrics_holdout_df),
+        "event_methodology_validation": validation_result,
+        "event_regime_code_used_as_predictor": validation_result.get(
+            "event_regime_code_used_as_predictor",
+            False,
+        ),
+    }
+
+    artifacts = {key: str(path) for key, path in artifact_paths.items()} if save_outputs else {}
+    if save_outputs:
+        artifacts["dashboard_payload"] = str(artifact_dir / DASHBOARD_PAYLOAD_FILENAME)
+
+    result = ForecastRunResult(
+        forecast=forecast_payload,
+        dashboard=dashboard_payload,
+        development_summary=summary_dev_df,
+        holdout_summary=summary_holdout_df,
+        development_results=dev_df_out,
+        holdout_results=holdout_df_out,
+        artifacts=artifacts,
+        metadata=metadata,
+    )
+
+    if save_outputs:
+        metadata_path = artifact_paths["run_metadata"]
+        metadata_path.write_text(
+            json.dumps(_clean_json_value(metadata), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        payload_path = artifact_dir / DASHBOARD_PAYLOAD_FILENAME
+        payload_path.write_text(
+            json.dumps(result_to_payload(result), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    return result
+
+
+def _clean_json_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return None
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, dict):
+        return {str(k): _clean_json_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clean_json_value(v) for v in value]
+    return value
+
+
+def dataframe_to_records(df: pd.DataFrame, tail: Optional[int] = None) -> List[Dict[str, Any]]:
+    source = df.tail(tail) if tail is not None else df
+    return [
+        {str(k): _clean_json_value(v) for k, v in row.items()}
+        for row in source.to_dict(orient="records")
+    ]
+
+
+def result_to_payload(result: ForecastRunResult, include_development_tail: int = 100) -> Dict[str, Any]:
+    return {
+        "forecast": _clean_json_value(result.forecast),
+        "dashboard": _clean_json_value(result.dashboard),
+        "development_summary": dataframe_to_records(result.development_summary),
+        "holdout_summary": dataframe_to_records(result.holdout_summary),
+        "development_results_tail": dataframe_to_records(result.development_results, tail=include_development_tail),
+        "holdout_results": dataframe_to_records(result.holdout_results),
+        "artifacts": result.artifacts,
+        "metadata": _clean_json_value(result.metadata),
+    }
+
+
+def _read_excel_records(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        df = pd.read_excel(path)
+    except Exception:
+        return []
+    return [
+        {str(k): _clean_json_value(v) for k, v in row.items()}
+        for row in df.to_dict(orient="records")
+    ]
+
+
+def load_dashboard_payload_from_artifacts(artifact_dir: Path | str) -> dict | None:
+    artifact_dir = Path(artifact_dir)
+    payload_path = artifact_dir / DASHBOARD_PAYLOAD_FILENAME
+    if payload_path.exists():
+        try:
+            return json.loads(payload_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+
+def reconstruct_payload_from_artifacts(artifact_dir: Path | str) -> dict:
+    artifact_dir = Path(artifact_dir)
+    payload = load_dashboard_payload_from_artifacts(artifact_dir)
+    if payload is not None:
+        return payload
+
+    forecast_path = artifact_dir / ARTIFACT_FILENAMES["final_forecast"]
+    if not forecast_path.exists():
+        raise FileNotFoundError(f"Required forecast artifact not found: {forecast_path}")
+
+    forecast_df = pd.read_excel(forecast_path)
+    if forecast_df.empty:
+        raise ValueError(f"Forecast artifact is empty: {forecast_path}")
+    forecast_row = forecast_df.iloc[0].to_dict()
+    forecast_payload = {
+        key: _clean_json_value(forecast_row.get(key))
+        for key in [
+            "forecast_date",
+            "forecast_label",
+            "horizon_days",
+            "pred_ridge",
+            "pred_xgb",
+            "blend_weight_xgb",
+            "regime_prob_high_vol",
+            "regime_flag",
+            "garch_anchor",
+            "garch_spec_used",
+            "final_forecast_blend",
+            "forecast_p05",
+            "forecast_p95",
+            "fixed_event_threshold",
+        ]
+    }
+
+    dev_df_out = pd.read_excel(artifact_dir / ARTIFACT_FILENAMES["development_results"]) if (artifact_dir / ARTIFACT_FILENAMES["development_results"]).exists() else pd.DataFrame()
+    holdout_df_out = pd.read_excel(artifact_dir / ARTIFACT_FILENAMES["holdout_results"]) if (artifact_dir / ARTIFACT_FILENAMES["holdout_results"]).exists() else pd.DataFrame()
+    summary_dev_df = pd.read_excel(artifact_dir / ARTIFACT_FILENAMES["development_summary"]) if (artifact_dir / ARTIFACT_FILENAMES["development_summary"]).exists() else pd.DataFrame()
+    summary_holdout_df = pd.read_excel(artifact_dir / ARTIFACT_FILENAMES["holdout_summary"]) if (artifact_dir / ARTIFACT_FILENAMES["holdout_summary"]).exists() else pd.DataFrame()
+    feat_df = pd.read_excel(artifact_dir / ARTIFACT_FILENAMES["model_ready_dataset"]) if (artifact_dir / ARTIFACT_FILENAMES["model_ready_dataset"]).exists() else pd.DataFrame()
+
+    development_result = {
+        "final_blend_weight": _clean_json_value(forecast_payload.get("blend_weight_xgb")),
+        "selected_garch_spec": {"name": _clean_json_value(forecast_payload.get("garch_spec_used"))},
+        "garch_gate": {},
+    }
+
+    volatility_index_history = build_volatility_index_history(dev_df_out, holdout_df_out)
+    dashboard = {
+        "volatility_index": {
+            "current": {
+                "value": percentile_rank_index(
+                    forecast_payload.get("final_forecast_blend"),
+                    _combined_reference(
+                        dev_df_out.get("actual"),
+                        dev_df_out.get("pred_blend"),
+                        holdout_df_out.get("actual"),
+                        holdout_df_out.get("pred_blend"),
+                    ),
+                ),
+                "classification_label": classify_volatility_index(
+                    percentile_rank_index(
+                        forecast_payload.get("final_forecast_blend"),
+                        _combined_reference(
+                            dev_df_out.get("actual"),
+                            dev_df_out.get("pred_blend"),
+                            holdout_df_out.get("actual"),
+                            holdout_df_out.get("pred_blend"),
+                        ),
+                    )
+                )["classification_label"],
+                "explanation": classify_volatility_index(
+                    percentile_rank_index(
+                        forecast_payload.get("final_forecast_blend"),
+                        _combined_reference(
+                            dev_df_out.get("actual"),
+                            dev_df_out.get("pred_blend"),
+                            holdout_df_out.get("actual"),
+                            holdout_df_out.get("pred_blend"),
+                        ),
+                    )
+                )["short_explanation"],
+                "recommended_interpretation": classify_volatility_index(
+                    percentile_rank_index(
+                        forecast_payload.get("final_forecast_blend"),
+                        _combined_reference(
+                            dev_df_out.get("actual"),
+                            dev_df_out.get("pred_blend"),
+                            holdout_df_out.get("actual"),
+                            holdout_df_out.get("pred_blend"),
+                        ),
+                    )
+                )["recommended_interpretation"],
+                "raw_forecast": forecast_payload.get("final_forecast_blend"),
+                "forecast_p05": forecast_payload.get("forecast_p05"),
+                "forecast_p95": forecast_payload.get("forecast_p95"),
+            },
+            "history": volatility_index_history,
+            "thresholds": [
+                {"range": "0-20", "classification_label": "Very Calm", **VOL_INDEX_DESCRIPTIONS["Very Calm"]},
+                {"range": "20-40", "classification_label": "Normal", **VOL_INDEX_DESCRIPTIONS["Normal"]},
+                {"range": "40-60", "classification_label": "Elevated", **VOL_INDEX_DESCRIPTIONS["Elevated"]},
+                {"range": "60-80", "classification_label": "High", **VOL_INDEX_DESCRIPTIONS["High"]},
+                {"range": "80-100", "classification_label": "Stress", **VOL_INDEX_DESCRIPTIONS["Stress"]},
+            ],
+        },
+        "regime": compute_regime_cards(feat_df) if not feat_df.empty else {},
+        "model_weights": compute_model_weight_commentary(forecast_payload, development_result),
+        "model_comparison": compute_model_comparison(summary_holdout_df, holdout_df_out),
+        "garch_selection": compute_garch_selection_commentary(development_result),
+        "feature_importance": {
+            "top_5": [],
+            "commentary": "Feature importance is not available for reconstructed payloads.",
+        },
+        "calendar_effect": compute_calendar_effects(feat_df) if not feat_df.empty else {},
+        "weekly_monthly_volatility": compute_weekly_monthly_volatility(feat_df) if not feat_df.empty else {},
+        "volatility_of_volatility": compute_volatility_of_volatility(feat_df) if not feat_df.empty else {},
+        "global_fx_comparison": compute_global_fx_comparison(feat_df) if not feat_df.empty else {},
+        "history": build_dashboard_history(holdout_df_out, volatility_index_history),
+        "summary": build_dashboard_summary(
+            forecast_payload,
+            {
+                "value": percentile_rank_index(
+                    forecast_payload.get("final_forecast_blend"),
+                    _combined_reference(
+                        dev_df_out.get("actual"),
+                        dev_df_out.get("pred_blend"),
+                        holdout_df_out.get("actual"),
+                        holdout_df_out.get("pred_blend"),
+                    ),
+                ),
+                "classification_label": classify_volatility_index(
+                    percentile_rank_index(
+                        forecast_payload.get("final_forecast_blend"),
+                        _combined_reference(
+                            dev_df_out.get("actual"),
+                            dev_df_out.get("pred_blend"),
+                            holdout_df_out.get("actual"),
+                            holdout_df_out.get("pred_blend"),
+                        ),
+                    )
+                )["classification_label"],
+            },
+            compute_garch_selection_commentary(development_result),
+            [],
+        ),
+    }
+
+    artifacts = {key: str(artifact_dir / filename) for key, filename in ARTIFACT_FILENAMES.items() if (artifact_dir / filename).exists()}
+    
+    # Determine base date from available data
+    base_date = None
+    if not feat_df.empty and "Date" in feat_df.columns:
+        try:
+            base_date = pd.to_datetime(feat_df["Date"]).max()
+            base_date = base_date.isoformat() if pd.notna(base_date) else None
+        except Exception:
+            base_date = None
+    
+    return {
+        "forecast": forecast_payload,
+        "dashboard": dashboard,
+        "development_summary": dataframe_to_records(summary_dev_df),
+        "holdout_summary": dataframe_to_records(summary_holdout_df),
+        "development_results_tail": dataframe_to_records(dev_df_out.tail(100) if not dev_df_out.empty else pd.DataFrame()),
+        "holdout_results": dataframe_to_records(holdout_df_out),
+        "artifacts": artifacts,
+        "base_date": base_date,
+        "run_datetime": None,  # Not available for reconstructed payloads
+        "metadata": {
+            "source_artifacts": {key: str(artifact_dir / filename) for key, filename in ARTIFACT_FILENAMES.items()},
+            "reconstructed_from_artifacts": True,
+        },
+    }
+
+
+# Additional imports required by the Streamlit dashboard layer.
+from io import BytesIO
+import base64
+import html
+from datetime import datetime, timezone, timedelta
+from typing import Iterable
+
 import plotly.graph_objects as go
 import streamlit as st
-
-from forecasting import (
-    ARTIFACT_FILENAMES,
-    RAW_FILE_PATH,
-    ROLLING_WINDOW,
-    VOL_TARGET_WINDOW,
-    get_expected_input_schema,
-    reconstruct_payload_from_artifacts,
-    result_to_payload,
-    run_pipeline,
-    validate_input_file,
-)
 
 # ============================================================
 # VolSight - Macro-Event FX Volatility Engine
@@ -806,16 +5066,6 @@ def get_logo_data_uri(logo_path: Path) -> str:
 
 def local_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-
-
-def default_input_path() -> Path:
-    """Return the default Excel path relative to the deployed app directory.
-
-    Streamlit Community Cloud runs the app on Linux from the GitHub repository.
-    Using BASE_DIR avoids accidental dependence on the process working directory.
-    """
-    raw_path = Path(RAW_FILE_PATH)
-    return raw_path if raw_path.is_absolute() else BASE_DIR / raw_path
 
 
 def find_latest_run_dir() -> Optional[Path]:
@@ -1853,8 +6103,9 @@ def validate_uploaded_file(uploaded_file: Any) -> None:
 
 
 def read_uploaded_excel(uploaded_file: Any) -> pd.DataFrame:
-    schema = fetch_schema()
-    return pd.read_excel(BytesIO(uploaded_file.getvalue()), sheet_name=schema.get("sheet_name", "Sheet1"))
+    # The forecasting pipeline validates and reads the official sheet name.
+    # Reading the same sheet here keeps the preview aligned with the model run.
+    return pd.read_excel(BytesIO(uploaded_file.getvalue()), sheet_name=SHEET_NAME)
 
 
 def run_forecast(uploaded_file: Any, progress_callback: Optional[Any] = None) -> dict:
@@ -1868,14 +6119,7 @@ def run_forecast(uploaded_file: Any, progress_callback: Optional[Any] = None) ->
         input_path = run_dir / safe_upload_name
         input_path.write_bytes(uploaded_file.getvalue())
     else:
-        input_path = default_input_path()
-        if not input_path.exists():
-            raise FileNotFoundError(
-                "No Excel file was uploaded and the default input file "
-                f"'{RAW_FILE_PATH}' was not found in the app repository. "
-                "Upload the dataset from the Data & Market Inputs page, or add "
-                "Final_data.xlsx to the GitHub repository root."
-            )
+        input_path = RAW_FILE_PATH
 
     validate_input_file(input_path)
     result = run_pipeline(
@@ -1913,14 +6157,10 @@ def render_expected_schema(schema: dict) -> None:
 def render_upload_preview(uploaded_file: Any, schema: dict) -> Dict[str, Any]:
     state: Dict[str, Any] = {"df": None, "missing": [], "error": None}
     if uploaded_file is None:
-        default_path = default_input_path()
-        if default_path.exists():
-            st.info(f"No upload selected. The app will use the default `{RAW_FILE_PATH}` included in the repository.")
+        if RAW_FILE_PATH.exists():
+            st.info(f"No upload selected. The app will use the bundled default file: `{RAW_FILE_PATH.name}`.")
         else:
-            st.warning(
-                "No upload selected and no default `Final_data.xlsx` was found in the repository. "
-                "Upload an Excel dataset before running the model."
-            )
+            st.warning("No upload selected and `Final_data.xlsx` is not bundled with the app. Upload an Excel file before running the forecast.")
         return state
     try:
         df = read_uploaded_excel(uploaded_file)
@@ -2460,12 +6700,7 @@ def render_data_market_inputs(payload: Optional[dict]) -> None:
     with c2:
         st.markdown("<div class='panel'><div class='panel-title'>Official model run</div><div class='panel-subtitle'>Run the validated macro-event engine with the current forecasting pipeline.</div>", unsafe_allow_html=True)
         st.write("Default input file:")
-        resolved_default_input = default_input_path()
         st.code(str(RAW_FILE_PATH))
-        if resolved_default_input.exists():
-            st.caption("Default dataset found in the repository.")
-        else:
-            st.caption("Default dataset not found. Upload an Excel dataset before running in Community Cloud.")
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
@@ -2475,11 +6710,11 @@ def render_data_market_inputs(payload: Optional[dict]) -> None:
 
     st.markdown("---")
     st.subheader("Run official forecast")
-    st.info("The official run uses the forecasting configuration embedded in `forecasting.py`. Scenario Laboratory is visual-only in this app version.")
-    no_input_available = uploaded_file is None and not default_input_path().exists()
-    run_disabled = bool(upload_state.get("missing") or upload_state.get("error") or no_input_available)
-    if no_input_available:
-        st.warning("Upload the Excel market dataset before running the forecast on Community Cloud.")
+    st.info("The official run uses the forecasting configuration embedded directly in this Streamlit app. Scenario Laboratory is visual-only in this app version.")
+    default_input_missing = uploaded_file is None and not RAW_FILE_PATH.exists()
+    if default_input_missing:
+        st.warning("Upload the official Excel market dataset first, or add `Final_data.xlsx` to the repository root.")
+    run_disabled = bool(upload_state.get("missing") or upload_state.get("error") or default_input_missing)
     progress_box = st.empty()
     if st.button("Run Final Macro-Event FX Volatility Engine", type="primary", disabled=run_disabled, use_container_width=True):
         try:
