@@ -14,6 +14,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import warnings
@@ -4108,7 +4109,24 @@ def reconstruct_payload_from_artifacts(artifact_dir: Path | str) -> dict:
 
     forecast_path = artifact_dir / ARTIFACT_FILENAMES["final_forecast"]
     if not forecast_path.exists():
-        raise FileNotFoundError(f"Required forecast artifact not found: {forecast_path}")
+        # Streamlit Community Cloud users often upload the final forecast Excel
+        # to the repository root. If a stale timestamped artifacts folder exists
+        # but is incomplete, fall back to the root-level artifact instead of
+        # crashing on artifacts/<run_id>/final_forecast_blend_3d.xlsx.
+        try:
+            root_forecast_path = BASE_DIR / ARTIFACT_FILENAMES["final_forecast"]
+        except NameError:
+            root_forecast_path = Path(ARTIFACT_FILENAMES["final_forecast"])
+        if artifact_dir != root_forecast_path.parent and root_forecast_path.exists():
+            artifact_dir = root_forecast_path.parent
+            forecast_path = root_forecast_path
+        else:
+            raise FileNotFoundError(
+                f"Required forecast artifact not found: {forecast_path}. "
+                f"Either run a new forecast or place {ARTIFACT_FILENAMES['final_forecast']} "
+                "next to this app file. Do not place only the file in a timestamped "
+                "artifacts folder unless the complete run folder exists."
+            )
 
     forecast_df = pd.read_excel(forecast_path)
     if forecast_df.empty:
@@ -5068,10 +5086,38 @@ def local_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
+def is_complete_run_dir(run_dir: Path) -> bool:
+    """Return True only for runs that are safe to load in the dashboard.
+
+    On Streamlit Community Cloud, a failed or interrupted run may leave behind
+    an empty timestamped folder. The previous version treated that folder as the
+    latest run and then failed because final_forecast_blend_3d.xlsx was missing.
+    """
+    run_dir = Path(run_dir)
+    if not run_dir.exists() or not run_dir.is_dir():
+        return False
+
+    payload_path = run_dir / PAYLOAD_CACHE_FILENAME
+    if payload_path.exists():
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            if payload.get("forecast") or payload.get("dashboard"):
+                return True
+        except Exception:
+            pass
+
+    final_forecast_path = run_dir / ARTIFACT_FILENAMES["final_forecast"]
+    return final_forecast_path.exists()
+
+
 def find_latest_run_dir() -> Optional[Path]:
     if not FORECAST_ARTIFACT_ROOT.exists():
         return None
-    run_dirs = [path for path in FORECAST_ARTIFACT_ROOT.iterdir() if path.is_dir()]
+    run_dirs = [
+        path
+        for path in FORECAST_ARTIFACT_ROOT.iterdir()
+        if path.is_dir() and is_complete_run_dir(path)
+    ]
     if not run_dirs:
         return None
     return max(run_dirs, key=lambda path: path.stat().st_mtime)
@@ -5220,14 +5266,41 @@ def save_dashboard_payload(payload: dict, run_dir: Path) -> None:
     (run_dir / PAYLOAD_CACHE_FILENAME).write_text(json.dumps(payload, default=str, indent=2), encoding="utf-8")
 
 
+def root_artifacts_are_loadable() -> bool:
+    """Return True if the repository root contains a usable saved dashboard state.
+
+    This supports the simple GitHub deployment pattern where
+    final_forecast_blend_3d.xlsx is uploaded next to app.py/code.py rather than
+    inside artifacts/<run_id>/.
+    """
+    root_payload = BASE_DIR / PAYLOAD_CACHE_FILENAME
+    root_final_forecast = BASE_DIR / ARTIFACT_FILENAMES["final_forecast"]
+
+    if root_payload.exists():
+        try:
+            payload = json.loads(root_payload.read_text(encoding="utf-8"))
+            if payload.get("forecast") or payload.get("dashboard"):
+                return True
+        except Exception:
+            pass
+
+    return root_final_forecast.exists()
+
+
+def root_artifacts_mtime() -> float:
+    root_payload = BASE_DIR / PAYLOAD_CACHE_FILENAME
+    root_final_forecast = BASE_DIR / ARTIFACT_FILENAMES["final_forecast"]
+    return max(_path_mtime(root_payload), _path_mtime(root_final_forecast))
+
+
 def load_latest_local() -> dict:
     latest_run = find_latest_run_dir()
-    root_payload = BASE_DIR / PAYLOAD_CACHE_FILENAME
-    latest_run_payload = latest_run / PAYLOAD_CACHE_FILENAME if latest_run is not None else None
-    use_root_artifacts = root_payload.exists() and (
-        latest_run_payload is None
-        or not latest_run_payload.exists()
-        or _path_mtime(root_payload) >= _path_mtime(latest_run_payload)
+
+    # Prefer a valid root-level saved result when it exists and is newer than
+    # the complete timestamped run. This matches the GitHub screenshot where
+    # final_forecast_blend_3d.xlsx was uploaded at repository root.
+    use_root_artifacts = root_artifacts_are_loadable() and (
+        latest_run is None or root_artifacts_mtime() >= _path_mtime(latest_run)
     )
 
     if use_root_artifacts:
@@ -5239,10 +5312,29 @@ def load_latest_local() -> dict:
         return payload
 
     if latest_run is None:
-        raise FileNotFoundError("No saved forecast artifacts were found.")
-    payload = load_dashboard_payload_from_artifacts(latest_run)
-    if payload is None:
-        payload = reconstruct_payload_from_artifacts(latest_run)
+        raise FileNotFoundError(
+            "No complete saved forecast artifacts were found. "
+            f"Upload {ARTIFACT_FILENAMES['final_forecast']} next to this app file, "
+            "or run a new forecast from the Data & Market Inputs page."
+        )
+
+    try:
+        payload = load_dashboard_payload_from_artifacts(latest_run)
+        if payload is None:
+            payload = reconstruct_payload_from_artifacts(latest_run)
+    except FileNotFoundError:
+        # Last-resort protection against stale folders created by interrupted
+        # cloud runs. If a root artifact exists, use it; otherwise surface a
+        # clear action message.
+        if root_artifacts_are_loadable():
+            payload = load_dashboard_payload_from_artifacts(BASE_DIR)
+            if payload is None:
+                payload = reconstruct_payload_from_artifacts(BASE_DIR)
+            payload["run_id"] = "root_artifacts"
+            payload["artifact_dir"] = str(BASE_DIR)
+            return payload
+        raise
+
     payload["run_id"] = latest_run.name
     payload["artifact_dir"] = str(latest_run)
     inferred_base_date = infer_base_date_from_run_dir(latest_run)
@@ -6113,32 +6205,39 @@ def run_forecast(uploaded_file: Any, progress_callback: Optional[Any] = None) ->
     run_dir = FORECAST_ARTIFACT_ROOT / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    if uploaded_file is not None:
-        validate_uploaded_file(uploaded_file)
-        safe_upload_name = Path(uploaded_file.name).name
-        input_path = run_dir / safe_upload_name
-        input_path.write_bytes(uploaded_file.getvalue())
-    else:
-        input_path = RAW_FILE_PATH
+    try:
+        if uploaded_file is not None:
+            validate_uploaded_file(uploaded_file)
+            safe_upload_name = Path(uploaded_file.name).name
+            input_path = run_dir / safe_upload_name
+            input_path.write_bytes(uploaded_file.getvalue())
+        else:
+            input_path = RAW_FILE_PATH
 
-    validate_input_file(input_path)
-    result = run_pipeline(
-        input_path=input_path,
-        output_dir=run_dir,
-        save_outputs=True,
-        progress_callback=progress_callback,
-    )
-    payload = result_to_payload(result)
-    payload["run_id"] = run_id
-    payload["run_datetime"] = datetime.now(timezone.utc).isoformat()
-    payload["artifacts"] = {key: str(path) for key, path in result.artifacts.items()}
-    payload["artifact_dir"] = str(run_dir)
-    base_date = infer_base_date_from_input_file(input_path)
-    if base_date:
-        payload["base_date"] = base_date
-        payload.setdefault("forecast", {})["base_date"] = base_date
-    save_dashboard_payload(payload, run_dir)
-    return payload
+        validate_input_file(input_path)
+        result = run_pipeline(
+            input_path=input_path,
+            output_dir=run_dir,
+            save_outputs=True,
+            progress_callback=progress_callback,
+        )
+        payload = result_to_payload(result)
+        payload["run_id"] = run_id
+        payload["run_datetime"] = datetime.now(timezone.utc).isoformat()
+        payload["artifacts"] = {key: str(path) for key, path in result.artifacts.items()}
+        payload["artifact_dir"] = str(run_dir)
+        base_date = infer_base_date_from_input_file(input_path)
+        if base_date:
+            payload["base_date"] = base_date
+            payload.setdefault("forecast", {})["base_date"] = base_date
+        save_dashboard_payload(payload, run_dir)
+        return payload
+    except Exception:
+        # Do not leave a broken timestamped folder that the dashboard will later
+        # treat as the latest saved run.
+        if run_dir.exists() and not is_complete_run_dir(run_dir):
+            shutil.rmtree(run_dir, ignore_errors=True)
+        raise
 
 
 def render_expected_schema(schema: dict) -> None:
@@ -6683,9 +6782,9 @@ def render_data_market_inputs(payload: Optional[dict]) -> None:
         st.markdown("<div class='panel'><div class='panel-title'>Saved local results</div><div class='panel-subtitle'>Open the latest generated model artifacts.</div>", unsafe_allow_html=True)
         latest = find_latest_run_dir()
         if latest:
-            st.write(f"Latest saved run: **{latest.name}**")
+            st.write(f"Latest complete saved run: **{latest.name}**")
         else:
-            st.info("No saved run detected yet.")
+            st.info("No complete saved run detected yet.")
         if st.button("Load latest saved results", type="primary", use_container_width=True):
             try:
                 loaded = load_latest_local()
@@ -8866,9 +8965,9 @@ with st.sidebar:
         st.rerun()
     latest_run = find_latest_run_dir()
     if latest_run:
-        st.caption(f"Latest local run: {latest_run.name}")
+        st.caption(f"Latest complete local run: {latest_run.name}")
     else:
-        st.caption("No saved local runs detected.")
+        st.caption("No complete saved local runs detected.")
     st.markdown("---")
     st.caption("Official forecast: validated macro-event engine. Scenario Laboratory provides calibration sensitivity overlays.")
 
